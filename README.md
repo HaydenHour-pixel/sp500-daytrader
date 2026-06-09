@@ -1,3 +1,6 @@
+## Why I Built This
+As a computer science major with a business minor, I thought that building a day trading bot would perfectly combine computer science and finance (two fields I am very interested in). Furthermore, I thought that the experience would give me the oportunity to learn more about micro patterns in the market and how they can be used to predict when to BUY, SELL, and HOLD within a very short period of time.
+
 # Vectorized S&P 500 Momentum Scanning & Position Rotation Engine
 
 An automated, data-driven quantitative trading pipeline built in Python that conducts a daily comprehensive alpha sweep across the entire S&P 500 index composition. The system executes optimized momentum crossover strategies using the **Alpaca Trading Client API** and high-performance concurrent data scraping via **Yahoo Finance**.
