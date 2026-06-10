@@ -9,8 +9,8 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 # =====================================================================
 # HARDENED STATE MACHINE INTRADAY ENGINE CONFIGURATION
 # =====================================================================
-API_KEY = "PKJO447RSJZ3QZTWIIQDR6EDP6"
-SECRET_KEY = "3YWa531t3FmhsZjxoQJGJTRoNHWWNyPmSKEu3115Y2Bp"
+API_KEY = "PKYOYOZ4LXH7YSZ7WFSG4EWT42"
+SECRET_KEY = "2WW321eYFNawsrN8ATDKXY1Kr7WLnbHJYjrzN6bGCTY5"
 
 # Target high-liquidity momentum squad
 TICKER_SQUAD = ["TSLA", "NVDA", "AMD", "AAPL", "MSFT", "META", "AMZN", "NFLX"]
