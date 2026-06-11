@@ -8,7 +8,7 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 # =====================================================================
-# HARD TARGET HIGH-FREQUENCY SCALPING ENGINE
+# UPGRADED HIGH-FREQUENCY SCALPING ENGINE WITH TIME & LOCK GUARDS
 # =====================================================================
 API_KEY = "PKYOYOZ4LXH7YSZ7WFSG4EWT42"
 SECRET_KEY = "2WW321eYFNawsrN8ATDKXY1Kr7WLnbHJYjrzN6bGCTY5"
@@ -23,6 +23,7 @@ STOP_LOSS_PCT = 0.007      # Cut losses quickly at -0.7%
 class AlphaHardTargetScalper:
     def __init__(self):
         self.client = TradingClient(API_KEY, SECRET_KEY, paper=True)
+        self.in_flight_sales = set()  # Local state lock to prevent duplicate order routing
 
     def calculate_rsi(self, df):
         if len(df) < 20: return 50
@@ -37,8 +38,15 @@ class AlphaHardTargetScalper:
 
     def execute_scalp_pipeline(self):
         now = datetime.now()
-        print(f"⏱️ Target Scan Initiated: {now.strftime('%H:%M:%S')}")
+        current_time_str = now.strftime('%H:%M:%S')
+        print(f"⏱️ Target Scan Initiated: {current_time_str}")
         
+        # TIME GUARD CONTROLS (EST)
+        # 15:45 (3:45 PM) - No more new positions allowed to avoid overnight exposure
+        # 15:57 (3:57 PM) - Hard E-Stop liquidation phase to go to 100% cash
+        market_close_imminent = now.hour == 15 and now.minute >= 45
+        emergency_liquidation_zone = now.hour == 15 and now.minute >= 57
+
         try:
             if not self.client.get_clock().is_open: return
         except Exception: return
@@ -47,6 +55,15 @@ class AlphaHardTargetScalper:
         positions = self.client.get_all_positions()
         portfolio = {pos.symbol: int(pos.qty) for pos in positions}
         
+        # --- EMERGENCY END OF DAY CASH-OUT OUTLET ---
+        if emergency_liquidation_zone and len(positions) > 0:
+            print("🚨 [POWER HOUR E-STOP] Market close imminent. Forcing total portfolio liquidation.")
+            for pos in positions:
+                if pos.symbol not in self.in_flight_sales:
+                    self.execute_order(pos.symbol, int(pos.qty), OrderSide.SELL)
+                    self.in_flight_sales.add(pos.symbol)
+            return
+
         account = self.client.get_account()
         target_cash_allocation = float(account.buying_power) * RISK_PORTFOLIO_PCT
 
@@ -62,13 +79,15 @@ class AlphaHardTargetScalper:
                 current_price = ticker_df['Close'].iloc[-1]
                 is_holding = ticker in portfolio
 
+                # Garbage collection: Release the sale lock once the position is officially cleared from Alpaca
+                if not is_holding and ticker in self.in_flight_sales:
+                    self.in_flight_sales.remove(ticker)
+
                 # --- OPEN POSITION EXITS: HARD TARGET EVALUATION ---
-                if is_holding:
-                    # Look up true average entry price directly from Alpaca Node
+                if is_holding and ticker not in self.in_flight_sales:
                     alpaca_position = next(pos for pos in positions if pos.symbol == ticker)
                     avg_entry_price = float(alpaca_position.avg_entry_price)
                     
-                    # Compute mathematical thresholds
                     target_tp = avg_entry_price * (1.0 + TAKE_PROFIT_PCT)
                     target_sl = avg_entry_price * (1.0 - STOP_LOSS_PCT)
 
@@ -76,10 +95,12 @@ class AlphaHardTargetScalper:
                     if current_price >= target_tp:
                         print(f"🎯 [TAKE PROFIT LOCKED] {ticker} hit target boundary at ${current_price:.2f} (Bought at ${avg_entry_price:.2f})")
                         self.execute_order(ticker, portfolio[ticker], OrderSide.SELL)
+                        self.in_flight_sales.add(ticker)
                         continue
                     elif current_price <= target_sl:
                         print(f"🛑 [SAFETY STOP TRIGGERED] {ticker} breached risk floor at ${current_price:.2f} (Bought at ${avg_entry_price:.2f})")
                         self.execute_order(ticker, portfolio[ticker], OrderSide.SELL)
+                        self.in_flight_sales.add(ticker)
                         continue
                         
                     # Backup technical exit loop
@@ -87,9 +108,14 @@ class AlphaHardTargetScalper:
                     if rsi >= 70:
                         print(f"💥 [INDICATOR EXIT] {ticker} hit overbought RSI ceiling at ${current_price:.2f}")
                         self.execute_order(ticker, portfolio[ticker], OrderSide.SELL)
+                        self.in_flight_sales.add(ticker)
 
                 # --- FLAT ENTRIES: MOMENTUM SCALP SEARCH ---
-                else:
+                elif not is_holding:
+                    if market_close_imminent:
+                        # Skip processing new signals if we are too close to the closing bell
+                        continue
+                        
                     rsi = self.calculate_rsi(ticker_df)
                     if rsi <= 30:
                         qty = int(target_cash_allocation // current_price)
@@ -110,7 +136,7 @@ class AlphaHardTargetScalper:
 
 if __name__ == "__main__":
     bot = AlphaHardTargetScalper()
-    print("⚡ Heavy Allocation Scalper with Fixed Target Guards Active.")
+    print("⚡ Heavy Allocation Scalper with Multi-Order Locks and Time Controls Active.")
     while True:
         bot.execute_scalp_pipeline()
         time.sleep(30)
