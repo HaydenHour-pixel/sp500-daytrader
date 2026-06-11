@@ -8,7 +8,7 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 # =====================================================================
-# UPGRADED HIGH-FREQUENCY SCALPING ENGINE WITH TIME & LOCK GUARDS
+# UPGRADED HIGH-FREQUENCY SCALPING ENGINE WITH AUTOMATED SHUTDOWN
 # =====================================================================
 API_KEY = "PKYOYOZ4LXH7YSZ7WFSG4EWT42"
 SECRET_KEY = "2WW321eYFNawsrN8ATDKXY1Kr7WLnbHJYjrzN6bGCTY5"
@@ -46,10 +46,6 @@ class AlphaHardTargetScalper:
         # 15:57 (3:57 PM) - Hard E-Stop liquidation phase to go to 100% cash
         market_close_imminent = now.hour == 15 and now.minute >= 45
         emergency_liquidation_zone = now.hour == 15 and now.minute >= 57
-
-        try:
-            if not self.client.get_clock().is_open: return
-        except Exception: return
 
         # Live cloud-syncing of open execution positions
         positions = self.client.get_all_positions()
@@ -134,9 +130,25 @@ class AlphaHardTargetScalper:
         except Exception as e:
             print(f"   ⚠️ Blocked: {e}")
 
+# =====================================================================
+# MAIN CONTROLLER LOOP WITH LIVE CLOSING TIME BREAKS
+# =====================================================================
 if __name__ == "__main__":
     bot = AlphaHardTargetScalper()
     print("⚡ Heavy Allocation Scalper with Multi-Order Locks and Time Controls Active.")
+    
     while True:
-        bot.execute_scalp_pipeline()
-        time.sleep(30)
+        try:
+            # Fetch market clock status from Alpaca API
+            clock = bot.client.get_clock()
+            
+            if not clock.is_open:
+                print(f"🛑 [SYSTEM SHUTDOWN] Market is currently closed. Terminating bot process safely.")
+                break  # Breaks the loop entirely, ending execution and cleaning up memory
+                
+            bot.execute_scalp_pipeline()
+            time.sleep(30)
+            
+        except Exception as e:
+            print(f"⚠️ Main loop exception encountered: {e}")
+            time.sleep(30)
