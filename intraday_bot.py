@@ -9,7 +9,7 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 # =====================================================================
-# PRODUCTION VOLATILITY-ADAPTIVE SCALPING ENGINE WITH FAIL-SAFES
+# PRODUCTION VOLATILITY-ADAPTIVE SCALPER ENGINE WITH FAIL-SAFES
 # =====================================================================
 API_KEY = "PKYOYOZ4LXH7YSZ7WFSG4EWT42"
 SECRET_KEY = "2WW321eYFNawsrN8ATDKXY1Kr7WLnbHJYjrzN6bGCTY5"
@@ -34,20 +34,23 @@ class AlphaHardTargetScalper:
         self._hydrate_state_from_csv()
 
     def _initialize_csv_files(self):
-        """Ensures both sheets exist with clean structural headers."""
+        """Ensures both sheets exist with clean structural headers and explicit types."""
         if not os.path.exists(SUMMARY_FILE):
             headers = ["Date"] + [f"{t}_PnL" for t in TICKER_SQUAD] + ["Total_PnL", "Wins", "Losses"]
             pd.DataFrame(columns=headers).to_csv(SUMMARY_FILE, index=False)
             
         if not os.path.exists(TRADE_FILE):
             headers = ["Trade_ID", "Ticker", "Type", "Qty", "Entry_Time", "Entry_Price", "Exit_Time", "Exit_Price", "PnL", "Status"]
-            pd.DataFrame(columns=headers).to_csv(TRADE_FILE, index=False)
+            # Force empty frame columns to be text-based upon creation to prevent float64 inference
+            df = pd.DataFrame(columns=headers)
+            df = df.astype({"Entry_Time": str, "Exit_Time": str, "Status": str, "Trade_ID": str})
+            df.to_csv(TRADE_FILE, index=False)
 
     def _hydrate_state_from_csv(self):
         """Reads ledger entries to recover state parameters on mid-day restart."""
         if not os.path.exists(TRADE_FILE): return
         
-        df = pd.read_csv(TRADE_FILE)
+        df = pd.read_csv(TRADE_FILE, dtype={"Entry_Time": str, "Exit_Time": str, "Status": str, "Trade_ID": str})
         if df.empty: return
         
         df['Entry_Time'] = df['Entry_Time'].astype(str)
@@ -63,11 +66,12 @@ class AlphaHardTargetScalper:
         print(f"🔄 State Recovery Complete: Loaded {len(closed_today)} entries. Today's Record: {self.daily_wins}W-{self.daily_losses}L")
 
     def _log_trade_entry(self, trade_id, ticker, qty, price):
-        """Appends a new pending LONG sequence row to the CSV file."""
-        df = pd.read_csv(TRADE_FILE)
+        """Appends a new pending LONG sequence row to the CSV file safely."""
+        # Enforce strict string dtypes on read to prevent type-casting errors
+        df = pd.read_csv(TRADE_FILE, dtype={"Entry_Time": str, "Exit_Time": str, "Status": str, "Trade_ID": str})
         new_row = {
-            "Trade_ID": trade_id, "Ticker": ticker, "Type": "LONG", "Qty": qty,
-            "Entry_Time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "Entry_Price": price,
+            "Trade_ID": str(trade_id), "Ticker": ticker, "Type": "LONG", "Qty": int(qty),
+            "Entry_Time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "Entry_Price": float(price),
             "Exit_Time": "", "Exit_Price": "", "PnL": 0.0, "Status": "OPEN"
         }
         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
@@ -75,19 +79,21 @@ class AlphaHardTargetScalper:
 
     def _log_trade_exit(self, ticker, qty, price):
         """Locates the oldest open position row for an asset, closes it, and recalibrates summaries."""
-        df = pd.read_csv(TRADE_FILE)
+        # Explicit dtypes prevent empty strings in Exit_Time from defaulting to float64
+        df = pd.read_csv(TRADE_FILE, dtype={"Entry_Time": str, "Exit_Time": str, "Status": str, "Trade_ID": str})
         open_mask = (df['Ticker'] == ticker) & (df['Status'] == 'OPEN')
         
         if not open_mask.any(): return
             
         idx = df[open_mask].index[0]
         entry_price = float(df.loc[idx, 'Entry_Price'])
-        trade_pnl = round((price - entry_price) * qty, 2)
+        trade_pnl = round((float(price) - entry_price) * int(qty), 2)
         
-        df.loc[idx, 'Exit_Time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        df.loc[idx, 'Exit_Price'] = price
-        df.loc[idx, 'PnL'] = trade_pnl
-        df.loc[idx, 'Status'] = "CLOSED"
+        # Modify values cleanly using explicit types
+        df.at[idx, 'Exit_Time'] = str(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        df.at[idx, 'Exit_Price'] = float(price)
+        df.at[idx, 'PnL'] = float(trade_pnl)
+        df.at[idx, 'Status'] = "CLOSED"
         df.to_csv(TRADE_FILE, index=False)
         
         self.ticker_pnl[ticker] += trade_pnl
@@ -166,11 +172,11 @@ class AlphaHardTargetScalper:
                         try:
                             latest_price = float(self.client.get_stock_latest_bar(pos.symbol).close)
                         except Exception:
-                            latest_price = float(pos.current_price) # Fallback to position snapshot
+                            latest_price = float(pos.current_price) 
                         self._log_trade_exit(pos.symbol, int(pos.qty), latest_price)
             return
 
-        # --- WARM-UP BUFFER: Fetch 2 days of history to seed early 9:30 AM moving averages ---
+        # --- WARM-UP BUFFER: Fetch 2 days of history to seed indicators ---
         try:
             shared_data = yf.download(TICKER_SQUAD, period="2d", interval="1m", group_by='ticker', progress=False, timeout=4)
         except Exception: return
@@ -216,7 +222,7 @@ class AlphaHardTargetScalper:
                         qty = int(target_cash_allocation // current_price)
                         if qty > 0:
                             trade_id = f"tr_{int(time.time())}"
-                            # VALIDATION HANDSHAKE: Only log if order is accepted
+                            # VALIDATION HANDSHAKE: Only log entry if broker accepts order
                             if self.execute_order(ticker, qty, OrderSide.BUY):
                                 self._log_trade_entry(trade_id, ticker, qty, current_price)
                     
