@@ -9,7 +9,7 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 # =====================================================================
-# DYNAMIC SCALPING ENGINE WITH RESET-RESISTANT CSV LEDGERS
+# PRODUCTION VOLATILITY-ADAPTIVE SCALPING ENGINE WITH FAIL-SAFES
 # =====================================================================
 API_KEY = "PKYOYOZ4LXH7YSZ7WFSG4EWT42"
 SECRET_KEY = "2WW321eYFNawsrN8ATDKXY1Kr7WLnbHJYjrzN6bGCTY5"
@@ -25,13 +25,11 @@ class AlphaHardTargetScalper:
         self.client = TradingClient(API_KEY, SECRET_KEY, paper=True)
         self.in_flight_sales = set()  
         
-        # Self-healing storage properties
         self.today_str = datetime.now().strftime('%Y-%m-%d')
         self.ticker_pnl = {ticker: 0.0 for ticker in TICKER_SQUAD}
         self.daily_wins = 0
         self.daily_losses = 0
         
-        # Bootstrap file architectures and synchronize past data if restarted
         self._initialize_csv_files()
         self._hydrate_state_from_csv()
 
@@ -52,10 +50,8 @@ class AlphaHardTargetScalper:
         df = pd.read_csv(TRADE_FILE)
         if df.empty: return
         
-        # Filter for rows matching today's system execution footprint
         df['Entry_Time'] = df['Entry_Time'].astype(str)
         today_trades = df[df['Entry_Time'].str.contains(self.today_str)]
-        
         closed_today = today_trades[today_trades['Status'] == 'CLOSED']
         
         for ticker in TICKER_SQUAD:
@@ -64,7 +60,7 @@ class AlphaHardTargetScalper:
             
         self.daily_wins = int((closed_today['PnL'] > 0).sum())
         self.daily_losses = int((closed_today['PnL'] <= 0).sum())
-        print(f"🔄 State Recovery complete: Loaded {len(closed_today)} closed entries. Today's Record: {self.daily_wins}W-{self.daily_losses}L")
+        print(f"🔄 State Recovery Complete: Loaded {len(closed_today)} entries. Today's Record: {self.daily_wins}W-{self.daily_losses}L")
 
     def _log_trade_entry(self, trade_id, ticker, qty, price):
         """Appends a new pending LONG sequence row to the CSV file."""
@@ -80,25 +76,20 @@ class AlphaHardTargetScalper:
     def _log_trade_exit(self, ticker, qty, price):
         """Locates the oldest open position row for an asset, closes it, and recalibrates summaries."""
         df = pd.read_csv(TRADE_FILE)
-        # Find the open row for this specific ticker
         open_mask = (df['Ticker'] == ticker) & (df['Status'] == 'OPEN')
         
-        if not open_mask.any():
-            return # Fallback safety guard if tracking mismatched
+        if not open_mask.any(): return
             
-        idx = df[open_mask].index[0] # Match via FIFO queue assignment
-        
+        idx = df[open_mask].index[0]
         entry_price = float(df.loc[idx, 'Entry_Price'])
         trade_pnl = round((price - entry_price) * qty, 2)
         
-        # Commit exit matrix update to rows
         df.loc[idx, 'Exit_Time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         df.loc[idx, 'Exit_Price'] = price
         df.loc[idx, 'PnL'] = trade_pnl
         df.loc[idx, 'Status'] = "CLOSED"
         df.to_csv(TRADE_FILE, index=False)
         
-        # Recalculate local variables and commit to master sheet dashboard
         self.ticker_pnl[ticker] += trade_pnl
         if trade_pnl > 0:
             self.daily_wins += 1
@@ -120,7 +111,6 @@ class AlphaHardTargetScalper:
             "Losses": self.daily_losses
         }
         
-        # Check if row entry for today already exists to modify or add cleanly
         if not df.empty and self.today_str in df['Date'].values:
             idx = df[df['Date'] == self.today_str].index[0]
             for col, val in summary_row.items():
@@ -156,24 +146,33 @@ class AlphaHardTargetScalper:
         market_close_imminent = now.hour == 15 and now.minute >= 45
         emergency_liquidation_zone = now.hour == 15 and now.minute >= 57
 
-        positions = self.client.get_all_positions()
-        portfolio = {pos.symbol: int(pos.qty) for pos in positions}
-        
+        # --- RATE LIMIT GUARD ---
+        try:
+            positions = self.client.get_all_positions()
+            portfolio = {pos.symbol: int(pos.qty) for pos in positions}
+            account = self.client.get_account()
+            target_cash_allocation = float(account.buying_power) * RISK_PORTFOLIO_PCT
+        except Exception as e:
+            print(f"⚠️ Alpaca connection throttled: {e}. Bypassing this scan loop.")
+            return
+
         # --- EMERGENCY END OF DAY CASH-OUT OUTLET ---
         if emergency_liquidation_zone and len(positions) > 0:
             print("🚨 [POWER HOUR E-STOP] Forcing total portfolio liquidation.")
             for pos in positions:
                 if pos.symbol not in self.in_flight_sales:
-                    self.execute_order(pos.symbol, int(pos.qty), OrderSide.SELL)
-                    self.in_flight_sales.add(pos.symbol)
-                    self._log_trade_exit(pos.symbol, int(pos.qty), float(self.client.get_stock_latest_bar(pos.symbol).close))
+                    if self.execute_order(pos.symbol, int(pos.qty), OrderSide.SELL):
+                        self.in_flight_sales.add(pos.symbol)
+                        try:
+                            latest_price = float(self.client.get_stock_latest_bar(pos.symbol).close)
+                        except Exception:
+                            latest_price = float(pos.current_price) # Fallback to position snapshot
+                        self._log_trade_exit(pos.symbol, int(pos.qty), latest_price)
             return
 
-        account = self.client.get_account()
-        target_cash_allocation = float(account.buying_power) * RISK_PORTFOLIO_PCT
-
+        # --- WARM-UP BUFFER: Fetch 2 days of history to seed early 9:30 AM moving averages ---
         try:
-            shared_data = yf.download(TICKER_SQUAD, period="1d", interval="1m", group_by='ticker', progress=False, timeout=4)
+            shared_data = yf.download(TICKER_SQUAD, period="2d", interval="1m", group_by='ticker', progress=False, timeout=4)
         except Exception: return
 
         for ticker in TICKER_SQUAD:
@@ -197,16 +196,16 @@ class AlphaHardTargetScalper:
                     target_sl = avg_entry_price - (atr * 1.5)
 
                     if current_price >= target_tp or current_price <= target_sl:
-                        self.execute_order(ticker, portfolio[ticker], OrderSide.SELL)
-                        self.in_flight_sales.add(ticker)
-                        self._log_trade_exit(ticker, portfolio[ticker], current_price)
+                        if self.execute_order(ticker, portfolio[ticker], OrderSide.SELL):
+                            self.in_flight_sales.add(ticker)
+                            self._log_trade_exit(ticker, portfolio[ticker], current_price)
                         continue
                         
                     rsi = self.calculate_rsi(ticker_df)
                     if rsi >= 72:
-                        self.execute_order(ticker, portfolio[ticker], OrderSide.SELL)
-                        self.in_flight_sales.add(ticker)
-                        self._log_trade_exit(ticker, portfolio[ticker], current_price)
+                        if self.execute_order(ticker, portfolio[ticker], OrderSide.SELL):
+                            self.in_flight_sales.add(ticker)
+                            self._log_trade_exit(ticker, portfolio[ticker], current_price)
 
                 # --- FLAT ENTRIES ---
                 elif not is_holding:
@@ -217,8 +216,9 @@ class AlphaHardTargetScalper:
                         qty = int(target_cash_allocation // current_price)
                         if qty > 0:
                             trade_id = f"tr_{int(time.time())}"
-                            self.execute_order(ticker, qty, OrderSide.BUY)
-                            self._log_trade_entry(trade_id, ticker, qty, current_price)
+                            # VALIDATION HANDSHAKE: Only log if order is accepted
+                            if self.execute_order(ticker, qty, OrderSide.BUY):
+                                self._log_trade_entry(trade_id, ticker, qty, current_price)
                     
             except Exception as e:
                 print(f"❌ Core processing error on asset {ticker}: {e}")
@@ -228,12 +228,14 @@ class AlphaHardTargetScalper:
             order = MarketOrderRequest(symbol=ticker, qty=qty, side=side, time_in_force=TimeInForce.DAY)
             self.client.submit_order(order)
             print(f"   ✅ DISPATCHED: {side.value.upper()} {qty} shares of {ticker}")
+            return True
         except Exception as e:
-            print(f"   ⚠️ Blocked: {e}")
+            print(f"   ⚠️ Blocked/Rejected by Alpaca: {e}")
+            return False
 
 if __name__ == "__main__":
     bot = AlphaHardTargetScalper()
-    print("⚡ Volatility-Adaptive Scalper Engine with Automated CSV Archivers Active.")
+    print("⚡ Volatility-Adaptive Fault-Tolerant Scalper Engine Active.")
     
     while True:
         try:
