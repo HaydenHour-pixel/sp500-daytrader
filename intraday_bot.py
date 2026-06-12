@@ -9,7 +9,7 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 # =====================================================================
-# PRODUCTION VOLATILITY-ADAPTIVE SCALPER ENGINE WITH FAIL-SAFES
+# HARDENED VOLATILITY-ADAPTIVE SCALPER ENGINE WITH SEQUENTIAL RISK GUARD
 # =====================================================================
 API_KEY = "PKYOYOZ4LXH7YSZ7WFSG4EWT42"
 SECRET_KEY = "2WW321eYFNawsrN8ATDKXY1Kr7WLnbHJYjrzN6bGCTY5"
@@ -41,7 +41,6 @@ class AlphaHardTargetScalper:
             
         if not os.path.exists(TRADE_FILE):
             headers = ["Trade_ID", "Ticker", "Type", "Qty", "Entry_Time", "Entry_Price", "Exit_Time", "Exit_Price", "PnL", "Status"]
-            # Force empty frame columns to be text-based upon creation to prevent float64 inference
             df = pd.DataFrame(columns=headers)
             df = df.astype({"Entry_Time": str, "Exit_Time": str, "Status": str, "Trade_ID": str})
             df.to_csv(TRADE_FILE, index=False)
@@ -67,7 +66,6 @@ class AlphaHardTargetScalper:
 
     def _log_trade_entry(self, trade_id, ticker, qty, price):
         """Appends a new pending LONG sequence row to the CSV file safely."""
-        # Enforce strict string dtypes on read to prevent type-casting errors
         df = pd.read_csv(TRADE_FILE, dtype={"Entry_Time": str, "Exit_Time": str, "Status": str, "Trade_ID": str})
         new_row = {
             "Trade_ID": str(trade_id), "Ticker": ticker, "Type": "LONG", "Qty": int(qty),
@@ -79,7 +77,6 @@ class AlphaHardTargetScalper:
 
     def _log_trade_exit(self, ticker, qty, price):
         """Locates the oldest open position row for an asset, closes it, and recalibrates summaries."""
-        # Explicit dtypes prevent empty strings in Exit_Time from defaulting to float64
         df = pd.read_csv(TRADE_FILE, dtype={"Entry_Time": str, "Exit_Time": str, "Status": str, "Trade_ID": str})
         open_mask = (df['Ticker'] == ticker) & (df['Status'] == 'OPEN')
         
@@ -89,7 +86,6 @@ class AlphaHardTargetScalper:
         entry_price = float(df.loc[idx, 'Entry_Price'])
         trade_pnl = round((float(price) - entry_price) * int(qty), 2)
         
-        # Modify values cleanly using explicit types
         df.at[idx, 'Exit_Time'] = str(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
         df.at[idx, 'Exit_Price'] = float(price)
         df.at[idx, 'PnL'] = float(trade_pnl)
@@ -156,8 +152,6 @@ class AlphaHardTargetScalper:
         try:
             positions = self.client.get_all_positions()
             portfolio = {pos.symbol: int(pos.qty) for pos in positions}
-            account = self.client.get_account()
-            target_cash_allocation = float(account.buying_power) * RISK_PORTFOLIO_PCT
         except Exception as e:
             print(f"⚠️ Alpaca connection throttled: {e}. Bypassing this scan loop.")
             return
@@ -213,16 +207,25 @@ class AlphaHardTargetScalper:
                             self.in_flight_sales.add(ticker)
                             self._log_trade_exit(ticker, portfolio[ticker], current_price)
 
-                # --- FLAT ENTRIES ---
+                # --- FLAT ENTRIES WITH SEQUENTIAL BUYING POWER GUARD ---
                 elif not is_holding:
                     if market_close_imminent: continue
                         
                     rsi = self.calculate_rsi(ticker_df)
                     if rsi <= 30:
-                        qty = int(target_cash_allocation // current_price)
-                        if qty > 0:
+                        # Fetch live available cash allocation inside the loop right before buying
+                        try:
+                            current_account = self.client.get_account()
+                            live_buying_power = float(current_account.buying_power)
+                        except Exception:
+                            print(f"⚠️ Account snapshot skipped for {ticker} due to connection delay.")
+                            continue
+
+                        allocated_cash = live_buying_power * RISK_PORTFOLIO_PCT
+                        qty = int(allocated_cash // current_price)
+                        
+                        if qty > 0 and allocated_cash <= live_buying_power:
                             trade_id = f"tr_{int(time.time())}"
-                            # VALIDATION HANDSHAKE: Only log entry if broker accepts order
                             if self.execute_order(ticker, qty, OrderSide.BUY):
                                 self._log_trade_entry(trade_id, ticker, qty, current_price)
                     
