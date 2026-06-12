@@ -8,17 +8,13 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 # =====================================================================
-# UPGRADED HIGH-FREQUENCY SCALPING ENGINE WITH AUTOMATED SHUTDOWN
+# DYNAMIC VOLATILITY-ADAPTIVE SCALPING ENGINE (ATR INTEGRATED)
 # =====================================================================
 API_KEY = "PKYOYOZ4LXH7YSZ7WFSG4EWT42"
 SECRET_KEY = "2WW321eYFNawsrN8ATDKXY1Kr7WLnbHJYjrzN6bGCTY5"
 
 TICKER_SQUAD = ["TSLA", "NVDA", "AMD", "AAPL", "MSFT", "META", "AMZN", "NFLX"]
 RISK_PORTFOLIO_PCT = 0.25  
-
-# Structural risk matrices for pinning high-capital intraday wins
-TAKE_PROFIT_PCT = 0.005    # Lock in wins at +0.5%
-STOP_LOSS_PCT = 0.007      # Cut losses quickly at -0.7%
 
 class AlphaHardTargetScalper:
     def __init__(self):
@@ -36,18 +32,33 @@ class AlphaHardTargetScalper:
         df['RSI'] = 100 - (100 / (1 + rs))
         return df['RSI'].iloc[-1]
 
+    def calculate_atr(self, df):
+        """Calculates 14-period Average True Range to measure real-time price variance."""
+        if len(df) < 15: 
+            return df['Close'].iloc[-1] * 0.005 # Fallback to standard 0.5% buffer if insufficient bars
+            
+        high = df['High']
+        low = df['Low']
+        close_prev = df['Close'].shift(1)
+        
+        # Calculate True Range (TR) matrix components
+        tr1 = high - low
+        tr2 = (high - close_prev).abs()
+        tr3 = (low - close_prev).abs()
+        
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(window=14).mean().iloc[-1]
+        return atr
+
     def execute_scalp_pipeline(self):
         now = datetime.now()
         current_time_str = now.strftime('%H:%M:%S')
         print(f"⏱️ Target Scan Initiated: {current_time_str}")
         
         # TIME GUARD CONTROLS (EST)
-        # 15:45 (3:45 PM) - No more new positions allowed to avoid overnight exposure
-        # 15:57 (3:57 PM) - Hard E-Stop liquidation phase to go to 100% cash
         market_close_imminent = now.hour == 15 and now.minute >= 45
         emergency_liquidation_zone = now.hour == 15 and now.minute >= 57
 
-        # Live cloud-syncing of open execution positions
         positions = self.client.get_all_positions()
         portfolio = {pos.symbol: int(pos.qty) for pos in positions}
         
@@ -75,33 +86,34 @@ class AlphaHardTargetScalper:
                 current_price = ticker_df['Close'].iloc[-1]
                 is_holding = ticker in portfolio
 
-                # Garbage collection: Release the sale lock once the position is officially cleared from Alpaca
+                # Release sale lock once position officially clears from Alpaca
                 if not is_holding and ticker in self.in_flight_sales:
                     self.in_flight_sales.remove(ticker)
 
-                # --- OPEN POSITION EXITS: HARD TARGET EVALUATION ---
+                # --- OPEN POSITION EXITS: VOLATILITY-ADJUSTED TARGETS ---
                 if is_holding and ticker not in self.in_flight_sales:
                     alpaca_position = next(pos for pos in positions if pos.symbol == ticker)
                     avg_entry_price = float(alpaca_position.avg_entry_price)
                     
-                    target_tp = avg_entry_price * (1.0 + TAKE_PROFIT_PCT)
-                    target_sl = avg_entry_price * (1.0 - STOP_LOSS_PCT)
+                    # Compute dynamic market boundary metrics
+                    atr = self.calculate_atr(ticker_df)
+                    target_tp = avg_entry_price + (atr * 2.5)  # 2.5x ATR for upside profit capture
+                    target_sl = avg_entry_price - (atr * 1.5)  # 1.5x ATR tight stop-loss protection
 
-                    # Guard Checkpoint Evaluation
                     if current_price >= target_tp:
-                        print(f"🎯 [TAKE PROFIT LOCKED] {ticker} hit target boundary at ${current_price:.2f} (Bought at ${avg_entry_price:.2f})")
+                        print(f"🎯 [ATR PROFIT TARGET MET] {ticker} caught wave at ${current_price:.2f} (Target was ${target_tp:.2f})")
                         self.execute_order(ticker, portfolio[ticker], OrderSide.SELL)
                         self.in_flight_sales.add(ticker)
                         continue
                     elif current_price <= target_sl:
-                        print(f"🛑 [SAFETY STOP TRIGGERED] {ticker} breached risk floor at ${current_price:.2f} (Bought at ${avg_entry_price:.2f})")
+                        print(f"🛑 [ATR RISK FLOOR BREACHED] {ticker} stopped safely at ${current_price:.2f} (Floor was ${target_sl:.2f})")
                         self.execute_order(ticker, portfolio[ticker], OrderSide.SELL)
                         self.in_flight_sales.add(ticker)
                         continue
                         
-                    # Backup technical exit loop
+                    # Secondary momentum velocity speed-bump exit
                     rsi = self.calculate_rsi(ticker_df)
-                    if rsi >= 70:
+                    if rsi >= 72:
                         print(f"💥 [INDICATOR EXIT] {ticker} hit overbought RSI ceiling at ${current_price:.2f}")
                         self.execute_order(ticker, portfolio[ticker], OrderSide.SELL)
                         self.in_flight_sales.add(ticker)
@@ -109,7 +121,6 @@ class AlphaHardTargetScalper:
                 # --- FLAT ENTRIES: MOMENTUM SCALP SEARCH ---
                 elif not is_holding:
                     if market_close_imminent:
-                        # Skip processing new signals if we are too close to the closing bell
                         continue
                         
                     rsi = self.calculate_rsi(ticker_df)
@@ -135,16 +146,15 @@ class AlphaHardTargetScalper:
 # =====================================================================
 if __name__ == "__main__":
     bot = AlphaHardTargetScalper()
-    print("⚡ Heavy Allocation Scalper with Multi-Order Locks and Time Controls Active.")
+    print("⚡ Volatility-Adaptive Scalper Engine with Automated Loop Shutdown Initialized.")
     
     while True:
         try:
-            # Fetch market clock status from Alpaca API
             clock = bot.client.get_clock()
             
             if not clock.is_open:
                 print(f"🛑 [SYSTEM SHUTDOWN] Market is currently closed. Terminating bot process safely.")
-                break  # Breaks the loop entirely, ending execution and cleaning up memory
+                break  # Breaks out of the while loop entirely to finish execution cleanly
                 
             bot.execute_scalp_pipeline()
             time.sleep(30)
