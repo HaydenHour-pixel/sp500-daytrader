@@ -31,6 +31,10 @@ if "stored_all_period_choice" not in st.session_state:
 if "stored_all_chart_style" not in st.session_state:
     st.session_state.stored_all_chart_style = "Buy/Sell Arrows Only"
 
+# Persistent toggle state for the Ticker Leaderboard Expander
+if "stored_leaderboard_expanded" not in st.session_state:
+    st.session_state.stored_leaderboard_expanded = True
+
 # Check if trade log exists
 if not os.path.exists(TRADE_FILE) or os.stat(TRADE_FILE).st_size == 0:
     st.info("ℹ️ No trade data found yet. Your cockpit will automatically populate once `trade_log.csv` records its first closed positions on Monday!")
@@ -84,27 +88,30 @@ else:
             idx_zoom = zoom_options.index(st.session_state.stored_single_buffer_choice)
             idx_style = style_options.index(st.session_state.stored_single_chart_style)
 
-            # Form-based filters with custom indexing to maintain state persistence
+            # Form-based filters with custom indexing and unique widget keys to prevent bleed-through
             col_sel1, col_sel2, col_sel3 = st.columns([2, 1, 1])
             with col_sel1:
                 selected_label = st.selectbox(
                     "Select a completed trade to plot:", 
                     trade_labels, 
-                    index=idx_label
+                    index=idx_label,
+                    key="single_trade_label_widget"
                 )
                 st.session_state.stored_single_selected_label = selected_label
             with col_sel2:
                 buffer_choice = st.selectbox(
                     "Visual Zoom Level:", 
                     zoom_options, 
-                    index=idx_zoom
+                    index=idx_zoom,
+                    key="single_zoom_widget"
                 )
                 st.session_state.stored_single_buffer_choice = buffer_choice
             with col_sel3:
                 chart_style = st.selectbox(
                     "Chart Representation:", 
                     style_options, 
-                    index=idx_style
+                    index=idx_style,
+                    key="single_style_widget"
                 )
                 st.session_state.stored_single_chart_style = chart_style
                 
@@ -203,9 +210,17 @@ else:
             st.markdown("Track continuous performance and asset execution vectors over a customizable historical horizon.")
             
             # =====================================================================
-            # 🏆 TICKER LEADERBOARD TRACKER COMPONENT (New & Enhanced!)
+            # 🏆 TICKER LEADERBOARD TRACKER COMPONENT
             # =====================================================================
-            with st.expander("🏆 Ticker Performance Leaderboard Tracker", expanded=True):
+            # Master Toggle Switch to programmatically freeze/restore the expanded state of the expander
+            leaderboard_expanded = st.toggle(
+                "Show Performance Leaderboard", 
+                value=st.session_state.stored_leaderboard_expanded,
+                help="Toggle to expand or collapse the performance leaderboard statistics grid below."
+            )
+            st.session_state.stored_leaderboard_expanded = leaderboard_expanded
+
+            with st.expander("🏆 Ticker Performance Leaderboard Tracker", expanded=leaderboard_expanded):
                 leaderboard_rows = []
                 for ticker in df_closed['Ticker'].unique():
                     ticker_trades = df_closed[df_closed['Ticker'] == ticker]
@@ -291,27 +306,30 @@ else:
             idx_horizon = horizon_options.index(st.session_state.stored_all_period_choice)
             idx_all_style = style_options.index(st.session_state.stored_all_chart_style)
 
-            # Interactive horizon selectors using unlinked index lookup logic
+            # Interactive horizon selectors with strict widget key configurations to isolate views
             col_sel1, col_sel2, col_sel3 = st.columns([2, 1, 1])
             with col_sel1:
                 selected_ticker = st.selectbox(
                     "Select a Stock to Analyze:", 
                     unique_tickers, 
-                    index=idx_ticker
+                    index=idx_ticker,
+                    key="all_ticker_widget"
                 )
                 st.session_state.stored_all_selected_ticker = selected_ticker
             with col_sel2:
                 period_choice = st.selectbox(
                     "Historical Chart Horizon:", 
                     horizon_options, 
-                    index=idx_horizon
+                    index=idx_horizon,
+                    key="all_horizon_widget"
                 )
                 st.session_state.stored_all_period_choice = period_choice
             with col_sel3:
                 all_chart_style = st.selectbox(
                     "Chart Representation:", 
                     style_options, 
-                    index=idx_all_style
+                    index=idx_all_style,
+                    key="all_style_widget"
                 )
                 st.session_state.stored_all_chart_style = all_chart_style
             
