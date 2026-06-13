@@ -4,22 +4,23 @@ import yfinance as yf
 from datetime import datetime, time as datetime_time
 
 # =====================================================================
-# BACKTESTING ENGINE FOR DUAL-ENGINE VOLATILITY SCALPER
+# STANDARDIZED DUAL-ENGINE BACKTESTER (ANTI-OVERFITTING VERSION)
 # =====================================================================
 
+# Unified allocations. No custom RSI tracking floors allowed here.
 TICKER_CONFIGS = {
-    "TSLA": {"rsi_buy_floor": 33, "max_share_allocation": 0.15},
-    "NVDA": {"rsi_buy_floor": 32, "max_share_allocation": 0.15},
-    "AMD":  {"rsi_buy_floor": 30, "max_share_allocation": 0.10},
-    "NFLX": {"rsi_buy_floor": 30, "max_share_allocation": 0.10},
-    "META": {"rsi_buy_floor": 30, "max_share_allocation": 0.10},
-    "MSFT": {"rsi_buy_floor": 28, "max_share_allocation": 0.10},
-    "AMZN": {"rsi_buy_floor": 28, "max_share_allocation": 0.10},
-    "AAPL": {"rsi_buy_floor": 24, "max_share_allocation": 0.10} 
+    "TSLA": {"max_share_allocation": 0.12},  
+    "NVDA": {"max_share_allocation": 0.12},  
+    "AMD":  {"max_share_allocation": 0.10},  
+    "NFLX": {"max_share_allocation": 0.10},  
+    "META": {"max_share_allocation": 0.10},  
+    "MSFT": {"max_share_allocation": 0.10},  
+    "AMZN": {"max_share_allocation": 0.10},  
+    "AAPL": {"max_share_allocation": 0.10}   
 }
 
 TICKER_SQUAD = list(TICKER_CONFIGS.keys())
-STARTING_CASH = 100000.0  # Simulated Paper Account Balance
+STARTING_CASH = 100000.0  # Simulated Base Capital
 
 def get_active_engine(timestamp) -> str:
     """Routes engine rules based on the historical timestamp's time."""
@@ -39,7 +40,6 @@ def calculate_rsi_series(df, period=14):
     avg_gain = gain.rolling(window=period, min_periods=period).mean()
     avg_loss = loss.rolling(window=period, min_periods=period).mean()
     
-    # Avoid division by zero
     rs = avg_gain / np.where(avg_loss == 0, 0.00001, avg_loss)
     return 100 - (100 / (1 + rs))
 
@@ -58,7 +58,7 @@ def calculate_atr_series(df, period=14):
     return tr.rolling(window=period, min_periods=period).mean()
 
 def run_backtest(ticker, df):
-    """Simulates trading logic tick-by-tick over historical data."""
+    """Simulates trading logic tick-by-tick using standardized systemic constants."""
     df = df.copy()
     df['RSI'] = calculate_rsi_series(df)
     df['ATR'] = calculate_atr_series(df)
@@ -69,28 +69,25 @@ def run_backtest(ticker, df):
     entry_price = 0.0
     trades = []
 
-    # Iterate chronologically through the data
     for idx, row in df.iterrows():
         timestamp = idx
         current_price = row['Close']
         current_rsi = row['RSI']
         current_atr = row['ATR']
         
-        # Time-based exit variables
         market_close_imminent = timestamp.hour == 15 and timestamp.minute >= 45
         emergency_liquidation_zone = timestamp.hour == 15 and timestamp.minute >= 57
         
         active_engine = get_active_engine(timestamp)
 
         # -----------------------------------------------------------------
-        # CHECK EXITS (IF HOLDING)
+        # EXITS SEQUENCE (IF HOLDING ASSET)
         # -----------------------------------------------------------------
         if position_qty > 0:
             atr_multiplier = 1.5 if active_engine == "ENGINE_A" else 1.0
             target_tp = entry_price + (current_atr * atr_multiplier * 2.0)
             target_sl = entry_price - (current_atr * atr_multiplier)
 
-            # Execution triggers
             hit_tp = current_price >= target_tp
             hit_sl = current_price <= target_sl
             hit_overbought = current_rsi >= 72
@@ -110,16 +107,15 @@ def run_backtest(ticker, df):
             continue
 
         # -----------------------------------------------------------------
-        # CHECK ENTRIES (IF FLAT)
+        # ENTRIES SEQUENCE (STANDARDIZED EDGE)
         # -----------------------------------------------------------------
         if position_qty == 0 and not market_close_imminent:
-            # Check dynamic floor adjustments
-            rsi_floor = TICKER_CONFIGS[ticker]["rsi_buy_floor"]
+            # Strict un-tweaked systemic rules
+            rsi_floor = 27.0
             if active_engine == "ENGINE_B":
-                rsi_floor -= 2.0  # Apply midday filter constraint
+                rsi_floor -= 3.0  # Sharp Midday Sniper Compression (24.0)
 
             if current_rsi <= rsi_floor:
-                # Calculate buying constraints matching live allocation framework
                 config = TICKER_CONFIGS[ticker]
                 allocated_cash = cash * config["max_share_allocation"]
                 qty = int(allocated_cash // current_price)
@@ -134,7 +130,7 @@ def run_backtest(ticker, df):
                         "PnL": 0.0, "Reason": "RSI_ENTRY", "Engine": active_engine
                     })
 
-    # Force close final positions at end of data array if still holding
+    # Clear out remnants at the absolute tail of data series arrays
     if position_qty > 0:
         final_price = df['Close'].iloc[-1]
         pnl = round((final_price - entry_price) * position_qty, 2)
@@ -147,16 +143,15 @@ def run_backtest(ticker, df):
     return pd.DataFrame(trades)
 
 # =====================================================================
-# MAIN RUNNER
+# LIVE EXECUTOR LOOP
 # =====================================================================
 if __name__ == "__main__":
     print("⏳ Downloading past 5 days of 1-minute interval market structures...")
-    # 5 days is yfinance's maximum limit for explicit 1-minute historical increments
     data = yf.download(TICKER_SQUAD, period="5d", interval="1m", group_by='ticker', progress=False)
     
     all_trade_ledgers = []
 
-    print("\n🚀 Beginning Vectorized Historical Run Sequences...")
+    print("\n🚀 Beginning Standardized Vectorized Runs (No Curve-Fitting)...")
     print("-" * 75)
     
     for ticker in TICKER_SQUAD:
@@ -168,7 +163,6 @@ if __name__ == "__main__":
         if not trade_log.empty:
             all_trade_ledgers.append(trade_log)
             
-        # Quick Calculation for Individual Stats
         sells = trade_log[trade_log['Type'] == "SELL"]
         ticker_net = sells['PnL'].sum()
         total_wins = (sells['PnL'] > 0).sum()
@@ -186,10 +180,9 @@ if __name__ == "__main__":
         print(f"🏆 BACKTEST COMPLETE. COMBINED OVERALL STRATEGY PnL: ${grand_pnl:.2f}")
         print(f"📊 Total Completed System Trades: {len(master_sells)}")
         
-        # Breakdown by Engine
         engine_a_pnl = master_sells[master_sells['Engine'] == "ENGINE_A"]['PnL'].sum()
         engine_b_pnl = master_sells[master_sells['Engine'] == "ENGINE_B"]['PnL'].sum()
         print(f"   ↳ Engine A (Momentum) Performance: ${engine_a_pnl:.2f}")
         print(f"   ↳ Engine B (Midday Lull) Performance: ${engine_b_pnl:.2f}")
     else:
-        print("❌ No trades triggered over this historical range. Threshold parameters are highly restrictive.")
+        print("❌ No trades executed. The system baseline parameters are heavily restrictive.")
