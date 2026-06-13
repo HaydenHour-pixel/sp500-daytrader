@@ -3,7 +3,7 @@ import pandas as pd
 import yfinance as yf
 import streamlit as st
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as datetime_time
 
 # Set up page configurations
 st.set_page_config(page_title="Alpha Volatility Cockpit", layout="wide", page_icon="📊")
@@ -12,6 +12,7 @@ st.title("📊 Alpha Volatility Scalper: Trading Cockpit")
 st.markdown("Use this visual utility to audit and review the entry and exit execution points captured by your live bot.")
 
 TRADE_FILE = "trade_log.csv"
+SUMMARY_FILE = "daily_summary.csv"
 
 # Check if trade log exists
 if not os.path.exists(TRADE_FILE) or os.stat(TRADE_FILE).st_size == 0:
@@ -26,6 +27,10 @@ else:
     if df_closed.empty:
         st.warning("⚠️ Found a trade log, but there are no completed (CLOSED) trades to visualize yet.")
     else:
+        # Sort by exit time to build chronological sequence
+        df_closed['Exit_Time'] = pd.to_datetime(df_closed['Exit_Time'])
+        df_closed = df_closed.sort_values(by='Exit_Time').reset_index(drop=True)
+        
         # Metrics Sidebar
         st.sidebar.header("System Session Performance")
         total_pnl = df_closed['PnL'].sum()
@@ -36,36 +41,61 @@ else:
         st.sidebar.metric("Total Session PnL", f"${total_pnl:,.2f}", delta=f"{total_pnl:+.2f}")
         st.sidebar.metric("Win Rate", f"{win_rate:.1f}%", delta=f"{wins}W - {losses}L")
         
-        # Mode Selection
+        # Mode Selection including our Macro Equity Curve View
         view_mode = st.sidebar.radio(
             "Select Analysis Perspective:",
-            ["Single Trade Audit", "All-in-One Asset View"]
+            ["Single Trade Audit", "All-in-One Asset View", "Macro Equity Curve"]
         )
         
         if view_mode == "Single Trade Audit":
             st.subheader("🔍 Audit Individual Executions")
-            st.markdown("Inspect a granular 1-minute candlestick window around a specific trade's timeline.")
+            st.markdown("Inspect trade execution timelines matched against live minute candles.")
             
-            # Format a clean dropdown label
-            df_closed['dropdown_label'] = df_closed.apply(
-                lambda r: f"{r['Ticker']} | PnL: ${r['PnL']:+.2f} | {r['Entry_Time']}", axis=1
-            )
-            
-            selected_label = st.selectbox("Select a completed trade to plot:", df_closed['dropdown_label'].tolist())
+            # Form-based filters for fine-tuned view controls
+            col_sel1, col_sel2, col_sel3 = st.columns([2, 1, 1])
+            with col_sel1:
+                # Format a clean dropdown label
+                df_closed['dropdown_label'] = df_closed.apply(
+                    lambda r: f"{r['Ticker']} | PnL: ${r['PnL']:+.2f} | {r['Entry_Time']}", axis=1
+                )
+                selected_label = st.selectbox("Select a completed trade to plot:", df_closed['dropdown_label'].tolist())
+            with col_sel2:
+                buffer_choice = st.selectbox(
+                    "Visual Zoom Level:",
+                    ["Tight Zoom (15m context)", "Standard Zoom (45m context)", "Wide Zoom (2h context)", "Show Full Day (Market Hours)"],
+                    index=1
+                )
+            with col_sel3:
+                chart_style = st.selectbox(
+                    "Chart Representation:",
+                    ["Candlesticks Only", "Line Chart (Close)", "Both (Candlesticks + Line)"],
+                    index=2  # Default to Both to show line overlaid on candles
+                )
+                
             selected_trade = df_closed[df_closed['dropdown_label'] == selected_label].iloc[0]
             
-            # Parsing entry and exit timestamps (tz-naive by default)
+            # Parsing entry and exit timestamps
             entry_dt = pd.to_datetime(selected_trade['Entry_Time'])
-            exit_dt = pd.to_datetime(selected_trade['Exit_Time'])
+            exit_dt = selected_trade['Exit_Time']
             ticker = selected_trade['Ticker']
             
-            # Buffer historical pull window to give context on chart
-            start_buffer = entry_dt - timedelta(minutes=45)
-            end_buffer = exit_dt + timedelta(minutes=45)
+            # Translate the context selection into standard datetimes
+            if buffer_choice == "Tight Zoom (15m context)":
+                start_buffer = entry_dt - timedelta(minutes=15)
+                end_buffer = exit_dt + timedelta(minutes=15)
+            elif buffer_choice == "Standard Zoom (45m context)":
+                start_buffer = entry_dt - timedelta(minutes=45)
+                end_buffer = exit_dt + timedelta(minutes=45)
+            elif buffer_choice == "Wide Zoom (2h context)":
+                start_buffer = entry_dt - timedelta(minutes=120)
+                end_buffer = exit_dt + timedelta(minutes=120)
+            else:
+                # Set bounds to standard market hours (09:30 - 16:00 EST) for the day of the trade
+                start_buffer = datetime.combine(entry_dt.date(), datetime_time(9, 30))
+                end_buffer = datetime.combine(entry_dt.date(), datetime_time(16, 0))
             
             st.info(f"⏳ Pulling historical 1-minute candlesticks for **{ticker}** on {entry_dt.strftime('%Y-%m-%d')}...")
             
-            # Fetch matching 1-minute historical bars
             try:
                 stock_data = yf.download(
                     ticker, 
@@ -74,122 +104,125 @@ else:
                     interval="1m",
                     progress=False
                 )
-                
                 if not stock_data.empty:
-                    # convert from tz-aware (America/New_York) to tz-naive
+                    # COLLAPSE MULTIINDEX COLUMNS: Safely flattens ('Close', 'TSLA') -> 'Close'
+                    if isinstance(stock_data.columns, pd.MultiIndex):
+                        stock_data.columns = stock_data.columns.droplevel(1)
+                        
                     if stock_data.index.tz is not None:
                         stock_data.index = stock_data.index.tz_localize(None)
                     
-                    # Safe comparison slice
+                    # Restrict data to calculated boundaries
                     stock_data = stock_data.loc[start_buffer:end_buffer]
             except Exception as e:
                 st.error(f"Failed to fetch market data: {e}")
                 stock_data = pd.DataFrame()
 
             if stock_data.empty:
-                st.error("❌ Unable to load historical intervals for this specific window. Make sure yfinance has data for this day.")
+                st.error("❌ Unable to load historical intervals for this specific window. Ensure market hours are correct.")
             else:
-                # Main chart construction
                 fig = go.Figure()
-
-                # 1. Base Candlestick Trace
-                fig.add_trace(go.Candlestick(
-                    x=stock_data.index,
-                    open=stock_data['Open'],
-                    high=stock_data['High'],
-                    low=stock_data['Low'],
-                    close=stock_data['Close'],
-                    name=f"{ticker} 1m Price"
-                ))
+                
+                # 1. Base Price Traces based on chosen layout representation style
+                if chart_style in ["Candlesticks Only", "Both (Candlesticks + Line)"]:
+                    fig.add_trace(go.Candlestick(
+                        x=stock_data.index, open=stock_data['Open'], high=stock_data['High'],
+                        low=stock_data['Low'], close=stock_data['Close'], name=f"{ticker} Candlesticks"
+                    ))
+                
+                if chart_style in ["Line Chart (Close)", "Both (Candlesticks + Line)"]:
+                    fig.add_trace(go.Scatter(
+                        x=stock_data.index, y=stock_data['Close'], mode="lines",
+                        line=dict(color="#3B82F6", width=2), name=f"{ticker} Price Line"
+                    ))
 
                 # 2. Buy Point Trace Marker
                 fig.add_trace(go.Scatter(
-                    x=[entry_dt],
-                    y=[selected_trade['Entry_Price']],
-                    mode="markers+text",
-                    marker=dict(symbol="triangle-up", color="#10B981", size=15),
-                    name="Buy Entry",
-                    text=[f"Buy Entry (${selected_trade['Entry_Price']:.2f})"],
-                    textposition="bottom center"
+                    x=[entry_dt], y=[selected_trade['Entry_Price']], mode="markers+text",
+                    marker=dict(symbol="triangle-up", color="#10B981", size=15, line=dict(color="white", width=1)),
+                    name="Buy Entry", text=[f"Buy Entry (${selected_trade['Entry_Price']:.2f})"], textposition="bottom center"
                 ))
-
+                
                 # 3. Sell Point Trace Marker
                 fig.add_trace(go.Scatter(
-                    x=[exit_dt],
-                    y=[selected_trade['Exit_Price']],
-                    mode="markers+text",
-                    marker=dict(symbol="triangle-down", color="#EF4444", size=15),
-                    name="Sell Exit",
-                    text=[f"Sell Exit (${selected_trade['Exit_Price']:.2f})"],
-                    textposition="top center"
+                    x=[exit_dt], y=[selected_trade['Exit_Price']], mode="markers+text",
+                    marker=dict(symbol="triangle-down", color="#EF4444", size=15, line=dict(color="white", width=1)),
+                    name="Sell Exit", text=[f"Sell Exit (${selected_trade['Exit_Price']:.2f})"], textposition="top center"
                 ))
-
-                # Update layout aesthetics for a premium dark mode feel
-                fig.update_layout(
-                    title=f"{ticker} Trade Audit Chart (Captured on {entry_dt.strftime('%m/%d/%Y')})",
-                    yaxis_title="Stock Price ($)",
-                    xaxis_title="Time",
-                    template="plotly_dark",
-                    height=650,
-                    xaxis_rangeslider_visible=False
-                )
-
-                st.plotly_chart(fig, width="stretch")
                 
-                # Display Trade Highlights Table
+                fig.update_layout(
+                    title=f"{ticker} Trade Audit Chart", yaxis_title="Stock Price ($)",
+                    template="plotly_dark", height=650, xaxis_rangeslider_visible=False
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
                 col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("Shares Traded", f"{selected_trade['Qty']} shares")
+                with col1: st.metric("Shares Traded", f"{selected_trade['Qty']} shares")
                 with col2:
                     holding_time = exit_dt - entry_dt
                     st.metric("Holding Duration", f"{holding_time.seconds // 60}m {holding_time.seconds % 60}s")
                 with col3:
                     engine_val = selected_trade['Engine'] if 'Engine' in selected_trade and pd.notna(selected_trade['Engine']) else "Legacy (N/A)"
                     st.metric("Trade Engine", str(engine_val))
-                with col4:
-                    st.metric("Net Gain/Loss", f"${selected_trade['PnL']:+.2f}")
+                with col4: st.metric("Net Gain/Loss", f"${selected_trade['PnL']:+.2f}")
 
         elif view_mode == "All-in-One Asset View":
             st.subheader("📈 All-in-One Asset View")
-            st.markdown("Track your entire weekly performance and trade sequences mapped over a continuous 5-day market timeline.")
+            st.markdown("Track continuous performance and asset execution vectors over a customizable historical horizon.")
             
-            # Select which ticker to map
-            unique_tickers = sorted(df_closed['Ticker'].unique())
-            selected_ticker = st.selectbox("Select a Stock to Analyze:", unique_tickers)
+            # Interactive horizon selectors
+            col_sel1, col_sel2, col_sel3 = st.columns([2, 1, 1])
+            with col_sel1:
+                unique_tickers = sorted(df_closed['Ticker'].unique())
+                selected_ticker = st.selectbox("Select a Stock to Analyze:", unique_tickers)
+            with col_sel2:
+                period_choice = st.selectbox(
+                    "Historical Chart Horizon:",
+                    ["5 Days (5m intervals)", "1 Month (15m intervals)", "3 Months (1h intervals)", "6 Months (Daily intervals)"],
+                    index=0
+                )
+            with col_sel3:
+                all_chart_style = st.selectbox(
+                    "Chart Representation:",
+                    ["Candlesticks Only", "Line Chart (Close)", "Both (Candlesticks + Line)"],
+                    index=2,  # Default to Both to overlay line on candles
+                    key="all_in_one_chart_style"
+                )
             
-            # Filter down trades to only the selected stock
             ticker_trades = df_closed[df_closed['Ticker'] == selected_ticker].copy()
             
-            # Calculate specific ticker performance
+            # Map time translation config variables
+            if period_choice == "5 Days (5m intervals)":
+                yf_period, yf_interval = "5d", "5m"
+            elif period_choice == "1 Month (15m intervals)":
+                yf_period, yf_interval = "1mo", "15m"
+            elif period_choice == "3 Months (1h intervals)":
+                yf_period, yf_interval = "3mo", "60m"
+            else:
+                yf_period, yf_interval = "6mo", "1d"
+            
+            # Performance statistics
             ticker_pnl = ticker_trades['PnL'].sum()
             ticker_wins = (ticker_trades['PnL'] > 0).sum()
             ticker_losses = (ticker_trades['PnL'] <= 0).sum()
             ticker_win_rate = (ticker_wins / len(ticker_trades)) * 100 if len(ticker_trades) > 0 else 0
             
-            # Visual Mini-Dashboard for Asset
             stat_col1, stat_col2, stat_col3 = st.columns(3)
-            with stat_col1:
-                st.metric(f"Total {selected_ticker} PnL", f"${ticker_pnl:,.2f}", delta=f"{ticker_pnl:+.2f}")
-            with stat_col2:
-                st.metric(f"Completed Trades", f"{len(ticker_trades)}")
-            with stat_col3:
-                st.metric(f"Win Rate", f"{ticker_win_rate:.1f}%", delta=f"{ticker_wins}W - {ticker_losses}L")
+            with stat_col1: st.metric(f"Total {selected_ticker} PnL", f"${ticker_pnl:,.2f}", delta=f"{ticker_pnl:+.2f}")
+            with stat_col2: st.metric(f"Completed Trades", f"{len(ticker_trades)}")
+            with stat_col3: st.metric(f"Win Rate", f"{ticker_win_rate:.1f}%", delta=f"{ticker_wins}W - {ticker_losses}L")
                 
-            st.info(f"⏳ Pulling continuous historical 5-day interval data for **{selected_ticker}**...")
+            st.info(f"⏳ Pulling continuous historical {yf_period} market candles for **{selected_ticker}**...")
             
-            # Fetch continuous 5-day historical timeline
             try:
-                # We use 5m bars for continuous 5d charts. It keeps loading speeds lighting-fast 
-                # while preventing Plotly from lagging when rendering hundreds of points.
-                stock_data = yf.download(
-                    selected_ticker, 
-                    period="5d",
-                    interval="5m",
-                    progress=False
-                )
-                
-                if not stock_data.empty and stock_data.index.tz is not None:
-                    stock_data.index = stock_data.index.tz_localize(None)
+                stock_data = yf.download(selected_ticker, period=yf_period, interval=yf_interval, progress=False)
+                if not stock_data.empty:
+                    # COLLAPSE MULTIINDEX COLUMNS: Safely flattens ('Close', 'TSLA') -> 'Close'
+                    if isinstance(stock_data.columns, pd.MultiIndex):
+                        stock_data.columns = stock_data.columns.droplevel(1)
+                        
+                    if stock_data.index.tz is not None:
+                        stock_data.index = stock_data.index.tz_localize(None)
             except Exception as e:
                 st.error(f"Failed to fetch market data: {e}")
                 stock_data = pd.DataFrame()
@@ -198,31 +231,36 @@ else:
                 st.error(f"❌ Unable to load historical market structure for {selected_ticker}.")
             else:
                 fig = go.Figure()
+                
+                # 1. Base Price Traces based on chosen layout representation style
+                if all_chart_style in ["Candlesticks Only", "Both (Candlesticks + Line)"]:
+                    fig.add_trace(go.Candlestick(
+                        x=stock_data.index, open=stock_data['Open'], high=stock_data['High'],
+                        low=stock_data['Low'], close=stock_data['Close'], name="Candlestick Price", opacity=0.4
+                    ))
+                
+                if all_chart_style in ["Line Chart (Close)", "Both (Candlesticks + Line)"]:
+                    fig.add_trace(go.Scatter(
+                        x=stock_data.index, y=stock_data['Close'], mode="lines",
+                        line=dict(color="#3B82F6", width=2), name="Close Price Line", opacity=0.8
+                    ))
 
-                # 1. Base Continuous Candlesticks
-                fig.add_trace(go.Candlestick(
-                    x=stock_data.index,
-                    open=stock_data['Open'],
-                    high=stock_data['High'],
-                    low=stock_data['Low'],
-                    close=stock_data['Close'],
-                    name="Market Price",
-                    opacity=0.6
-                ))
-
-                # Lists to hold batch scatters for clean legends
                 buy_x, buy_y, buy_text = [], [], []
                 sell_x, sell_y, sell_text = [], [], []
 
-                # 2. Loop and map each individual trade execution path
+                # Find earliest date of downloaded stock data to filter trade mapping index
+                min_market_date = stock_data.index.min()
+
                 for i, trade in ticker_trades.iterrows():
-                    trade_id = trade['Trade_ID'] if 'Trade_ID' in trade else f"Legacy_{i}"
                     t_entry = pd.to_datetime(trade['Entry_Time'])
                     t_exit = pd.to_datetime(trade['Exit_Time'])
                     
-                    p_entry = float(trade['Entry_Price'])
-                    p_exit = float(trade['Exit_Price'])
-                    pnl = float(trade['PnL'])
+                    # Only map trade lines if they fall within the selected zoom timeframe
+                    if t_entry < min_market_date:
+                        continue
+                        
+                    trade_id = trade['Trade_ID'] if 'Trade_ID' in trade else f"Legacy_{i}"
+                    p_entry, p_exit, pnl = float(trade['Entry_Price']), float(trade['Exit_Price']), float(trade['PnL'])
                     
                     buy_x.append(t_entry)
                     buy_y.append(p_entry)
@@ -232,48 +270,69 @@ else:
                     sell_y.append(p_exit)
                     sell_text.append(f"Sell #{trade_id} @ ${p_exit:.2f}<br>PnL: ${pnl:+.2f}")
 
-                    # Draw matching execution path vector (connections lines)
-                    path_color = "#10B981" if pnl > 0 else "#EF4444"
                     fig.add_trace(go.Scatter(
-                        x=[t_entry, t_exit],
-                        y=[p_entry, p_exit],
-                        mode="lines",
-                        line=dict(color=path_color, width=2, dash="dash"),
-                        hoverinfo="text",
-                        hovertext=f"Trade Sequence {trade_id}<br>Duration: {t_exit - t_entry}<br>PnL: ${pnl:+.2f}",
-                        showlegend=False
+                        x=[t_entry, t_exit], y=[p_entry, p_exit], mode="lines",
+                        line=dict(color="#10B981" if pnl > 0 else "#EF4444", width=2, dash="dash"),
+                        hoverinfo="text", hovertext=f"Trade {trade_id}<br>PnL: ${pnl:+.2f}", showlegend=False
                     ))
 
-                # Batch plot all entry nodes
-                fig.add_trace(go.Scatter(
-                    x=buy_x,
-                    y=buy_y,
-                    mode="markers",
-                    marker=dict(symbol="triangle-up", color="#10B981", size=12, line=dict(color="white", width=1)),
-                    name="Buy Entries",
-                    hoverinfo="text",
-                    hovertext=buy_text
-                ))
+                if buy_x:
+                    fig.add_trace(go.Scatter(x=buy_x, y=buy_y, mode="markers", marker=dict(symbol="triangle-up", color="#10B981", size=12, line=dict(color="white", width=1)), name="Buy Entries", hoverinfo="text", hovertext=buy_text))
+                    fig.add_trace(go.Scatter(x=sell_x, y=sell_y, mode="markers", marker=dict(symbol="triangle-down", color="#EF4444", size=12, line=dict(color="white", width=1)), name="Sell Exits", hoverinfo="text", hovertext=sell_text))
+                
+                fig.update_layout(title=f"Continuous Visual for {selected_ticker}", yaxis_title="Stock Price ($)", template="plotly_dark", height=700, xaxis_rangeslider_visible=True)
+                st.plotly_chart(fig, use_container_width=True)
 
-                # Batch plot all exit nodes
-                fig.add_trace(go.Scatter(
-                    x=sell_x,
-                    y=sell_y,
-                    mode="markers",
-                    marker=dict(symbol="triangle-down", color="#EF4444", size=12, line=dict(color="white", width=1)),
-                    name="Sell Exits",
-                    hoverinfo="text",
-                    hovertext=sell_text
-                ))
-
-                # Beautiful layout parameters
-                fig.update_layout(
-                    title=f"All-in-One Execution Map for {selected_ticker} (5-Day Continuous Visual)",
-                    yaxis_title="Stock Price ($)",
-                    xaxis_title="Timeline",
-                    template="plotly_dark",
-                    height=700,
-                    xaxis_rangeslider_visible=True,  # Adding RangeSlider so user can zoom seamlessly
-                )
-
-                st.plotly_chart(fig, width="stretch")
+        elif view_mode == "Macro Equity Curve":
+            st.subheader("📉 Strategy Account Equity Curve")
+            st.markdown("Monitor the cumulative capital performance of your deployment over time.")
+            
+            # Compute a continuous cumulative sum of PnL from closed trades
+            df_closed['Cumulative_PnL'] = df_closed['PnL'].cumsum()
+            
+            # Construct Equity Curve Line Plot
+            fig = go.Figure()
+            
+            # Fill under the line color dynamically (Green if overall winning, Red if overall losing)
+            fill_color = "rgba(16, 185, 129, 0.15)" if total_pnl >= 0 else "rgba(239, 68, 68, 0.15)"
+            line_color = "#10B981" if total_pnl >= 0 else "#EF4444"
+            
+            fig.add_trace(go.Scatter(
+                x=df_closed['Exit_Time'],
+                y=df_closed['Cumulative_PnL'],
+                mode='lines+markers',
+                name='Cumulative Performance',
+                line=dict(color=line_color, width=3),
+                fill='tozeroy',
+                fillcolor=fill_color,
+                hovertemplate="<b>Time:</b> %{x}<br><b>Net Profit:</b> $%{y:,.2f}<extra></extra>"
+            ))
+            
+            # Reference benchmark line at $0.00 profit
+            fig.add_shape(
+                type="line", x0=df_closed['Exit_Time'].min(), x1=df_closed['Exit_Time'].max(),
+                y0=0, y1=0, line=dict(color="rgba(255,255,255,0.3)", width=1, dash="dot")
+            )
+            
+            fig.update_layout(
+                title="Account Capital Growth Curve (Net Cumulative Return)",
+                yaxis_title="Total Profits / Losses ($)",
+                xaxis_title="Execution Timeline",
+                template="plotly_dark",
+                height=600
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Additional Analytical Insight Box
+            st.markdown("### 📊 Portfolio Metrics Dashboard")
+            m_col1, m_col2, m_col3 = st.columns(3)
+            with m_col1:
+                largest_win = df_closed['PnL'].max()
+                st.metric("Best Single Trade", f"${largest_win:,.2f}")
+            with m_col2:
+                largest_loss = df_closed['PnL'].min()
+                st.metric("Worst Single Trade", f"${largest_loss:,.2f}")
+            with m_col3:
+                avg_trade = df_closed['PnL'].mean()
+                st.metric("Expectancy (Avg/Trade)", f"${avg_trade:+.2f}")
