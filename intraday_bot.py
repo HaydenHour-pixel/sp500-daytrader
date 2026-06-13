@@ -9,6 +9,17 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from dotenv import load_dotenv
+from bot_enhancements import get_high_volatility_tickers, calculate_trailing_stop, should_exit_trade
+
+def calculate_trailing_stop(current_price, entry_price, trailing_percent=0.005):
+    """Returns the dynamic trailing stop level."""
+    if current_price > entry_price:
+        return current_price * (1 - trailing_percent)
+    return entry_price * 0.99  # Static 1% stop if not in profit yet
+
+def should_exit_trade(current_price, trailing_stop_level):
+    """Returns True if the trailing stop is breached."""
+    return current_price <= trailing_stop_level
 
 # Load secure environment configurations
 load_dotenv()
@@ -238,24 +249,25 @@ class AlphaHardTargetScalper:
                     self.in_flight_sales.remove(ticker)
 
                 # =========================================================
-                # PASS 1: EXITS AND ATR RISK TARGET TRACKING
+                # PASS 1: EXITS WITH TRAILING STOP AND PROFIT TARGET
                 # =========================================================
                 if is_holding and ticker not in self.in_flight_sales:
                     alpaca_position = next(pos for pos in positions if pos.symbol == ticker)
                     avg_entry_price = float(alpaca_position.avg_entry_price)
                     
+                    # Calculate dynamic levels
+                    trailing_level = calculate_trailing_stop(current_price, avg_entry_price)
                     atr = self.calculate_atr(ticker_df)
-                    atr_multiplier = 1.5 if active_engine == "ENGINE_A" else 1.0
-                    
-                    target_tp = avg_entry_price + (atr * atr_multiplier * 2.0)
-                    target_sl = avg_entry_price - (atr * atr_multiplier)
+                    target_tp = avg_entry_price + (atr * 2.0) 
 
-                    if current_price >= target_tp or current_price <= target_sl:
+                    # Execute exit if trailing stop is breached OR profit target reached
+                    if current_price >= target_tp or should_exit_trade(current_price, trailing_level):
                         if self.execute_order(ticker, portfolio[ticker], OrderSide.SELL):
                             self.in_flight_sales.add(ticker)
                             self._log_trade_exit(ticker, portfolio[ticker], current_price)
                         continue
                         
+                    # Backup RSI exit
                     rsi = self.calculate_rsi(ticker_df)
                     if rsi >= 72:
                         if self.execute_order(ticker, portfolio[ticker], OrderSide.SELL):
@@ -285,7 +297,6 @@ class AlphaHardTargetScalper:
                             trade_id = f"tr_{int(time.time())}"
                             if self.execute_order(ticker, qty, OrderSide.BUY):
                                 self._log_trade_entry(trade_id, ticker, qty, current_price, active_engine)
-                                # Post notification details directly on entry
                                 send_slack_alert(
                                     f"🚀 *Position Opened ({ticker})*\n"
                                     f"• Action: *BUY*\n"
@@ -309,8 +320,12 @@ class AlphaHardTargetScalper:
             return False
 
 if __name__ == "__main__":
+    # Dynamically scan the top 5 most volatile tickers
+    print("🔍 Pre-Market Scan: Identifying high-volatility assets...")
+    TICKER_SQUAD = get_high_volatility_tickers(list(TICKER_CONFIGS.keys()))
+    print(f"✅ Scanning complete. Trading today: {TICKER_SQUAD}")
+
     bot = AlphaHardTargetScalper()
-    print("⚡ Volatility-Adaptive Standardized Scalper Engine Active with Slack Notifications.")
     
     while True:
         try:
