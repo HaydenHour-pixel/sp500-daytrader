@@ -1,6 +1,6 @@
 import os
 import time
-from datetime import datetime
+from datetime import datetime, time as datetime_time
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -9,12 +9,24 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 # =====================================================================
-# HARDENED VOLATILITY-ADAPTIVE SCALPER ENGINE WITH SEQUENTIAL RISK GUARD
+# HARDENED DUAL-ENGINE VOLATILITY SCALPER ENGINE WITH ASSET PROFILES
 # =====================================================================
 API_KEY = "PKYOYOZ4LXH7YSZ7WFSG4EWT42"
 SECRET_KEY = "2WW321eYFNawsrN8ATDKXY1Kr7WLnbHJYjrzN6bGCTY5"
 
-TICKER_SQUAD = ["TSLA", "NVDA", "AMD", "AAPL", "MSFT", "META", "AMZN", "NFLX"]
+# Multi-Engine Asset Profiles (The AAPL Filter Fix)
+TICKER_CONFIGS = {
+    "TSLA": {"rsi_buy_floor": 33, "max_share_allocation": 0.15},
+    "NVDA": {"rsi_buy_floor": 32, "max_share_allocation": 0.15},
+    "AMD":  {"rsi_buy_floor": 30, "max_share_allocation": 0.10},
+    "NFLX": {"rsi_buy_floor": 30, "max_share_allocation": 0.10},
+    "META": {"rsi_buy_floor": 30, "max_share_allocation": 0.10},
+    "MSFT": {"rsi_buy_floor": 28, "max_share_allocation": 0.10},
+    "AMZN": {"rsi_buy_floor": 28, "max_share_allocation": 0.10},
+    "AAPL": {"rsi_buy_floor": 24, "max_share_allocation": 0.10}  # Fixed over-trading noise
+}
+
+TICKER_SQUAD = list(TICKER_CONFIGS.keys())
 RISK_PORTFOLIO_PCT = 0.25  
 
 SUMMARY_FILE = "daily_summary.csv"
@@ -34,22 +46,23 @@ class AlphaHardTargetScalper:
         self._hydrate_state_from_csv()
 
     def _initialize_csv_files(self):
-        """Ensures both sheets exist with clean structural headers and explicit types."""
+        """Ensures both sheets exist with clean structural headers including Engine tracking."""
         if not os.path.exists(SUMMARY_FILE):
             headers = ["Date"] + [f"{t}_PnL" for t in TICKER_SQUAD] + ["Total_PnL", "Wins", "Losses"]
             pd.DataFrame(columns=headers).to_csv(SUMMARY_FILE, index=False)
             
         if not os.path.exists(TRADE_FILE):
-            headers = ["Trade_ID", "Ticker", "Type", "Qty", "Entry_Time", "Entry_Price", "Exit_Time", "Exit_Price", "PnL", "Status"]
+            # Added "Engine" tracking column explicitly matching requirements
+            headers = ["Trade_ID", "Ticker", "Type", "Qty", "Entry_Time", "Entry_Price", "Exit_Time", "Exit_Price", "PnL", "Status", "Engine"]
             df = pd.DataFrame(columns=headers)
-            df = df.astype({"Entry_Time": str, "Exit_Time": str, "Status": str, "Trade_ID": str})
+            df = df.astype({"Entry_Time": str, "Exit_Time": str, "Status": str, "Trade_ID": str, "Engine": str})
             df.to_csv(TRADE_FILE, index=False)
 
     def _hydrate_state_from_csv(self):
         """Reads ledger entries to recover state parameters on mid-day restart."""
         if not os.path.exists(TRADE_FILE): return
         
-        df = pd.read_csv(TRADE_FILE, dtype={"Entry_Time": str, "Exit_Time": str, "Status": str, "Trade_ID": str})
+        df = pd.read_csv(TRADE_FILE, dtype={"Entry_Time": str, "Exit_Time": str, "Status": str, "Trade_ID": str, "Engine": str})
         if df.empty: return
         
         df['Entry_Time'] = df['Entry_Time'].astype(str)
@@ -64,30 +77,55 @@ class AlphaHardTargetScalper:
         self.daily_losses = int((closed_today['PnL'] <= 0).sum())
         print(f"🔄 State Recovery Complete: Loaded {len(closed_today)} entries. Today's Record: {self.daily_wins}W-{self.daily_losses}L")
 
-    def _log_trade_entry(self, trade_id, ticker, qty, price):
-        """Appends a new pending LONG sequence row to the CSV file safely."""
-        df = pd.read_csv(TRADE_FILE, dtype={"Entry_Time": str, "Exit_Time": str, "Status": str, "Trade_ID": str})
+    def get_active_engine(self) -> str:
+        """Evaluates time blocks to route structural execution parameters."""
+        current_time = datetime.now().time()
+        lull_start = datetime_time(11, 30)
+        lull_end = datetime_time(13, 30)
+        
+        if lull_start <= current_time < lull_end:
+            return "ENGINE_B"  # Midday Conservative Mean-Reversion
+        return "ENGINE_A"      # High-Velocity Momentum Run
+
+    def check_buy_signal(self, ticker: str, current_rsi: float) -> bool:
+        """Determines entry conditions adjusting dynamically for asset profile and engine."""
+        if ticker not in TICKER_CONFIGS:
+            rsi_threshold = 30.0
+        else:
+            rsi_threshold = TICKER_CONFIGS[ticker]["rsi_buy_floor"]
+
+        current_engine = self.get_active_engine()
+        
+        # Midday Lull Engine (Engine B) drops thresholds further to avoid fakeouts
+        if current_engine == "ENGINE_B":
+            rsi_threshold -= 2.0
+            
+        return current_rsi <= rsi_threshold
+
+    def _log_trade_entry(self, trade_id, ticker, qty, price, engine_used):
+        """Appends a new pending LONG sequence row to the CSV file safely with active engine profile."""
+        df = pd.read_csv(TRADE_FILE, dtype={"Entry_Time": str, "Exit_Time": str, "Status": str, "Trade_ID": str, "Engine": str})
         new_row = {
             "Trade_ID": str(trade_id), "Ticker": ticker, "Type": "LONG", "Qty": int(qty),
-            "Entry_Time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "Entry_Price": float(price),
-            "Exit_Time": "", "Exit_Price": "", "PnL": 0.0, "Status": "OPEN"
+            "Entry_Time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "Entry_Price": round(float(price), 2),
+            "Exit_Time": "", "Exit_Price": "", "PnL": 0.0, "Status": "OPEN", "Engine": engine_used
         }
         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
         df.to_csv(TRADE_FILE, index=False)
 
     def _log_trade_exit(self, ticker, qty, price):
         """Locates the oldest open position row for an asset, closes it, and recalibrates summaries."""
-        df = pd.read_csv(TRADE_FILE, dtype={"Entry_Time": str, "Exit_Time": str, "Status": str, "Trade_ID": str})
+        df = pd.read_csv(TRADE_FILE, dtype={"Entry_Time": str, "Exit_Time": str, "Status": str, "Trade_ID": str, "Engine": str})
         open_mask = (df['Ticker'] == ticker) & (df['Status'] == 'OPEN')
         
         if not open_mask.any(): return
             
         idx = df[open_mask].index[0]
         entry_price = float(df.loc[idx, 'Entry_Price'])
-        trade_pnl = round((float(price) - entry_price) * int(qty), 2)
+        trade_pnl = round((round(float(price), 2) - entry_price) * int(qty), 2)
         
         df.at[idx, 'Exit_Time'] = str(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-        df.at[idx, 'Exit_Price'] = float(price)
+        df.at[idx, 'Exit_Price'] = round(float(price), 2)
         df.at[idx, 'PnL'] = float(trade_pnl)
         df.at[idx, 'Status'] = "CLOSED"
         df.to_csv(TRADE_FILE, index=False)
@@ -143,12 +181,12 @@ class AlphaHardTargetScalper:
 
     def execute_scalp_pipeline(self):
         now = datetime.now()
-        print(f"⏱️ Target Scan Initiated: {now.strftime('%H:%M:%S')}")
+        active_engine = self.get_active_engine()
+        print(f"⏱️ Target Scan Initiated: {now.strftime('%H:%M:%S')} | Engine Profile: {active_engine}")
         
         market_close_imminent = now.hour == 15 and now.minute >= 45
         emergency_liquidation_zone = now.hour == 15 and now.minute >= 57
 
-        # --- RATE LIMIT GUARD ---
         try:
             positions = self.client.get_all_positions()
             portfolio = {pos.symbol: int(pos.qty) for pos in positions}
@@ -156,7 +194,6 @@ class AlphaHardTargetScalper:
             print(f"⚠️ Alpaca connection throttled: {e}. Bypassing this scan loop.")
             return
 
-        # --- EMERGENCY END OF DAY CASH-OUT OUTLET ---
         if emergency_liquidation_zone and len(positions) > 0:
             print("🚨 [POWER HOUR E-STOP] Forcing total portfolio liquidation.")
             for pos in positions:
@@ -170,7 +207,6 @@ class AlphaHardTargetScalper:
                         self._log_trade_exit(pos.symbol, int(pos.qty), latest_price)
             return
 
-        # --- WARM-UP BUFFER: Fetch 2 days of history to seed indicators ---
         try:
             shared_data = yf.download(TICKER_SQUAD, period="2d", interval="1m", group_by='ticker', progress=False, timeout=4)
         except Exception: return
@@ -186,14 +222,20 @@ class AlphaHardTargetScalper:
                 if not is_holding and ticker in self.in_flight_sales:
                     self.in_flight_sales.remove(ticker)
 
-                # --- OPEN POSITION EXITS ---
+                # =========================================================
+                # PASS 1: OPEN POSITION RISKS AND TRACKING EXITS
+                # =========================================================
                 if is_holding and ticker not in self.in_flight_sales:
                     alpaca_position = next(pos for pos in positions if pos.symbol == ticker)
                     avg_entry_price = float(alpaca_position.avg_entry_price)
                     
                     atr = self.calculate_atr(ticker_df)
-                    target_tp = avg_entry_price + (atr * 2.5)
-                    target_sl = avg_entry_price - (atr * 1.5)
+                    
+                    # Engine Routing Risk Modifiers
+                    atr_multiplier = 1.5 if active_engine == "ENGINE_A" else 1.0
+                    
+                    target_tp = avg_entry_price + (atr * atr_multiplier * 2.0)
+                    target_sl = avg_entry_price - (atr * atr_multiplier)
 
                     if current_price >= target_tp or current_price <= target_sl:
                         if self.execute_order(ticker, portfolio[ticker], OrderSide.SELL):
@@ -207,13 +249,16 @@ class AlphaHardTargetScalper:
                             self.in_flight_sales.add(ticker)
                             self._log_trade_exit(ticker, portfolio[ticker], current_price)
 
-                # --- FLAT ENTRIES WITH SEQUENTIAL BUYING POWER GUARD ---
+                # =========================================================
+                # PASS 2: FLAT ENTRIES WITH THE UPGRADED DUAL SIGNAL ENGINE
+                # =========================================================
                 elif not is_holding:
                     if market_close_imminent: continue
                         
                     rsi = self.calculate_rsi(ticker_df)
-                    if rsi <= 30:
-                        # Fetch live available cash allocation inside the loop right before buying
+                    
+                    # Linked direct to asset-customized routing logic function
+                    if self.check_buy_signal(ticker, rsi):
                         try:
                             current_account = self.client.get_account()
                             live_buying_power = float(current_account.buying_power)
@@ -221,13 +266,16 @@ class AlphaHardTargetScalper:
                             print(f"⚠️ Account snapshot skipped for {ticker} due to connection delay.")
                             continue
 
-                        allocated_cash = live_buying_power * RISK_PORTFOLIO_PCT
+                        # Sizing adjusted safely against distinct capital allocations
+                        config = TICKER_CONFIGS.get(ticker, {"max_share_allocation": 0.10})
+                        allocated_cash = live_buying_power * config["max_share_allocation"]
                         qty = int(allocated_cash // current_price)
                         
                         if qty > 0 and allocated_cash <= live_buying_power:
                             trade_id = f"tr_{int(time.time())}"
                             if self.execute_order(ticker, qty, OrderSide.BUY):
-                                self._log_trade_entry(trade_id, ticker, qty, current_price)
+                                # Added engine execution tracking parameters cleanly to log history rows
+                                self._log_trade_entry(trade_id, ticker, qty, current_price, active_engine)
                     
             except Exception as e:
                 print(f"❌ Core processing error on asset {ticker}: {e}")
