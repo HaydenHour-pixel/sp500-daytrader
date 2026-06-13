@@ -7,12 +7,18 @@ import yfinance as yf
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
+from dotenv import load_load_env
+
+load_dotenv()
 
 # =====================================================================
 # HARDENED DUAL-ENGINE VOLATILITY SCALPER ENGINE WITH ASSET PROFILES
 # =====================================================================
-API_KEY = "PKYOYOZ4LXH7YSZ7WFSG4EWT42"
-SECRET_KEY = "2WW321eYFNawsrN8ATDKXY1Kr7WLnbHJYjrzN6bGCTY5"
+API_KEY = os.getenv("ALPACA_API_KEY")
+SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+
+if not API_KEY or not SECRET_KEY:
+    raise ValueError("❌ CRITICAL ERROR: Alpaca API credentials missing. Check your local .env file.")
 
 # Multi-Engine Asset Profiles (The AAPL Filter Fix)
 TICKER_CONFIGS = {
