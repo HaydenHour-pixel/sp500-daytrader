@@ -68,8 +68,8 @@ else:
             with col_sel3:
                 chart_style = st.selectbox(
                     "Chart Representation:",
-                    ["Candlesticks Only", "Line Chart (Close)", "Both (Candlesticks + Line)"],
-                    index=2  # Default to Both to show line overlaid on candles
+                    ["Buy/Sell Arrows Only", "Stock Graph Only", "Both (Stock Graph + Arrows)"],
+                    index=2  # Default to Both (Stock Graph + Arrows)
                 )
                 
             selected_trade = df_closed[df_closed['dropdown_label'] == selected_label].iloc[0]
@@ -123,32 +123,28 @@ else:
             else:
                 fig = go.Figure()
                 
-                # 1. Base Price Traces based on chosen layout representation style
-                if chart_style in ["Candlesticks Only", "Both (Candlesticks + Line)"]:
-                    fig.add_trace(go.Candlestick(
-                        x=stock_data.index, open=stock_data['Open'], high=stock_data['High'],
-                        low=stock_data['Low'], close=stock_data['Close'], name=f"{ticker} Candlesticks"
-                    ))
-                
-                if chart_style in ["Line Chart (Close)", "Both (Candlesticks + Line)"]:
+                # 1. Base Price Line Trace (if Stock Graph is enabled)
+                if chart_style in ["Stock Graph Only", "Both (Stock Graph + Arrows)"]:
                     fig.add_trace(go.Scatter(
                         x=stock_data.index, y=stock_data['Close'], mode="lines",
-                        line=dict(color="#3B82F6", width=2), name=f"{ticker} Price Line"
+                        line=dict(color="#3B82F6", width=2), name=f"{ticker} Close Price"
                     ))
 
-                # 2. Buy Point Trace Marker
-                fig.add_trace(go.Scatter(
-                    x=[entry_dt], y=[selected_trade['Entry_Price']], mode="markers+text",
-                    marker=dict(symbol="triangle-up", color="#10B981", size=15, line=dict(color="white", width=1)),
-                    name="Buy Entry", text=[f"Buy Entry (${selected_trade['Entry_Price']:.2f})"], textposition="bottom center"
-                ))
-                
-                # 3. Sell Point Trace Marker
-                fig.add_trace(go.Scatter(
-                    x=[exit_dt], y=[selected_trade['Exit_Price']], mode="markers+text",
-                    marker=dict(symbol="triangle-down", color="#EF4444", size=15, line=dict(color="white", width=1)),
-                    name="Sell Exit", text=[f"Sell Exit (${selected_trade['Exit_Price']:.2f})"], textposition="top center"
-                ))
+                # 2. Buy/Sell Arrows (if Arrows are enabled)
+                if chart_style in ["Buy/Sell Arrows Only", "Both (Stock Graph + Arrows)"]:
+                    # Buy Point Trace Marker
+                    fig.add_trace(go.Scatter(
+                        x=[entry_dt], y=[selected_trade['Entry_Price']], mode="markers+text",
+                        marker=dict(symbol="triangle-up", color="#10B981", size=15, line=dict(color="white", width=1)),
+                        name="Buy Entry", text=[f"Buy Entry (${selected_trade['Entry_Price']:.2f})"], textposition="bottom center"
+                    ))
+                    
+                    # Sell Point Trace Marker
+                    fig.add_trace(go.Scatter(
+                        x=[exit_dt], y=[selected_trade['Exit_Price']], mode="markers+text",
+                        marker=dict(symbol="triangle-down", color="#EF4444", size=15, line=dict(color="white", width=1)),
+                        name="Sell Exit", text=[f"Sell Exit (${selected_trade['Exit_Price']:.2f})"], textposition="top center"
+                    ))
                 
                 fig.update_layout(
                     title=f"{ticker} Trade Audit Chart", yaxis_title="Stock Price ($)",
@@ -178,21 +174,23 @@ else:
             with col_sel2:
                 period_choice = st.selectbox(
                     "Historical Chart Horizon:",
-                    ["5 Days (5m intervals)", "1 Month (15m intervals)", "3 Months (1h intervals)", "6 Months (Daily intervals)"],
-                    index=0
+                    ["1 Day (1m intervals)", "5 Days (5m intervals)", "1 Month (15m intervals)", "3 Months (1h intervals)", "6 Months (Daily intervals)"],
+                    index=1  # Default to 5 Days
                 )
             with col_sel3:
                 all_chart_style = st.selectbox(
                     "Chart Representation:",
-                    ["Candlesticks Only", "Line Chart (Close)", "Both (Candlesticks + Line)"],
-                    index=2,  # Default to Both to overlay line on candles
+                    ["Buy/Sell Arrows Only", "Stock Graph Only", "Both (Stock Graph + Arrows)"],
+                    index=2,  # Default to Both (Stock Graph + Arrows)
                     key="all_in_one_chart_style"
                 )
             
             ticker_trades = df_closed[df_closed['Ticker'] == selected_ticker].copy()
             
             # Map time translation config variables
-            if period_choice == "5 Days (5m intervals)":
+            if period_choice == "1 Day (1m intervals)":
+                yf_period, yf_interval = "1d", "1m"
+            elif period_choice == "5 Days (5m intervals)":
                 yf_period, yf_interval = "5d", "5m"
             elif period_choice == "1 Month (15m intervals)":
                 yf_period, yf_interval = "1mo", "15m"
@@ -232,53 +230,49 @@ else:
             else:
                 fig = go.Figure()
                 
-                # 1. Base Price Traces based on chosen layout representation style
-                if all_chart_style in ["Candlesticks Only", "Both (Candlesticks + Line)"]:
-                    fig.add_trace(go.Candlestick(
-                        x=stock_data.index, open=stock_data['Open'], high=stock_data['High'],
-                        low=stock_data['Low'], close=stock_data['Close'], name="Candlestick Price", opacity=0.4
-                    ))
-                
-                if all_chart_style in ["Line Chart (Close)", "Both (Candlesticks + Line)"]:
+                # 1. Base Price Line Trace (if Stock Graph is enabled)
+                if all_chart_style in ["Stock Graph Only", "Both (Stock Graph + Arrows)"]:
                     fig.add_trace(go.Scatter(
                         x=stock_data.index, y=stock_data['Close'], mode="lines",
                         line=dict(color="#3B82F6", width=2), name="Close Price Line", opacity=0.8
                     ))
 
-                buy_x, buy_y, buy_text = [], [], []
-                sell_x, sell_y, sell_text = [], [], []
+                # 2. Buy/Sell Arrows and Connection Vectors (if Arrows are enabled)
+                if all_chart_style in ["Buy/Sell Arrows Only", "Both (Stock Graph + Arrows)"]:
+                    buy_x, buy_y, buy_text = [], [], []
+                    sell_x, sell_y, sell_text = [], [], []
 
-                # Find earliest date of downloaded stock data to filter trade mapping index
-                min_market_date = stock_data.index.min()
+                    # Find earliest date of downloaded stock data to filter trade mapping index
+                    min_market_date = stock_data.index.min()
 
-                for i, trade in ticker_trades.iterrows():
-                    t_entry = pd.to_datetime(trade['Entry_Time'])
-                    t_exit = pd.to_datetime(trade['Exit_Time'])
-                    
-                    # Only map trade lines if they fall within the selected zoom timeframe
-                    if t_entry < min_market_date:
-                        continue
+                    for i, trade in ticker_trades.iterrows():
+                        t_entry = pd.to_datetime(trade['Entry_Time'])
+                        t_exit = pd.to_datetime(trade['Exit_Time'])
                         
-                    trade_id = trade['Trade_ID'] if 'Trade_ID' in trade else f"Legacy_{i}"
-                    p_entry, p_exit, pnl = float(trade['Entry_Price']), float(trade['Exit_Price']), float(trade['PnL'])
-                    
-                    buy_x.append(t_entry)
-                    buy_y.append(p_entry)
-                    buy_text.append(f"Buy #{trade_id} @ ${p_entry:.2f}")
+                        # Only map trade lines if they fall within the selected zoom timeframe
+                        if t_entry < min_market_date:
+                            continue
+                            
+                        trade_id = trade['Trade_ID'] if 'Trade_ID' in trade else f"Legacy_{i}"
+                        p_entry, p_exit, pnl = float(trade['Entry_Price']), float(trade['Exit_Price']), float(trade['PnL'])
+                        
+                        buy_x.append(t_entry)
+                        buy_y.append(p_entry)
+                        buy_text.append(f"Buy #{trade_id} @ ${p_entry:.2f}")
 
-                    sell_x.append(t_exit)
-                    sell_y.append(p_exit)
-                    sell_text.append(f"Sell #{trade_id} @ ${p_exit:.2f}<br>PnL: ${pnl:+.2f}")
+                        sell_x.append(t_exit)
+                        sell_y.append(p_exit)
+                        sell_text.append(f"Sell #{trade_id} @ ${p_exit:.2f}<br>PnL: ${pnl:+.2f}")
 
-                    fig.add_trace(go.Scatter(
-                        x=[t_entry, t_exit], y=[p_entry, p_exit], mode="lines",
-                        line=dict(color="#10B981" if pnl > 0 else "#EF4444", width=2, dash="dash"),
-                        hoverinfo="text", hovertext=f"Trade {trade_id}<br>PnL: ${pnl:+.2f}", showlegend=False
-                    ))
+                        fig.add_trace(go.Scatter(
+                            x=[t_entry, t_exit], y=[p_entry, p_exit], mode="lines",
+                            line=dict(color="#10B981" if pnl > 0 else "#EF4444", width=2, dash="dash"),
+                            hoverinfo="text", hovertext=f"Trade {trade_id}<br>PnL: ${pnl:+.2f}", showlegend=False
+                        ))
 
-                if buy_x:
-                    fig.add_trace(go.Scatter(x=buy_x, y=buy_y, mode="markers", marker=dict(symbol="triangle-up", color="#10B981", size=12, line=dict(color="white", width=1)), name="Buy Entries", hoverinfo="text", hovertext=buy_text))
-                    fig.add_trace(go.Scatter(x=sell_x, y=sell_y, mode="markers", marker=dict(symbol="triangle-down", color="#EF4444", size=12, line=dict(color="white", width=1)), name="Sell Exits", hoverinfo="text", hovertext=sell_text))
+                    if buy_x:
+                        fig.add_trace(go.Scatter(x=buy_x, y=buy_y, mode="markers", marker=dict(symbol="triangle-up", color="#10B981", size=12, line=dict(color="white", width=1)), name="Buy Entries", hoverinfo="text", hovertext=buy_text))
+                        fig.add_trace(go.Scatter(x=sell_x, y=sell_y, mode="markers", marker=dict(symbol="triangle-down", color="#EF4444", size=12, line=dict(color="white", width=1)), name="Sell Exits", hoverinfo="text", hovertext=sell_text))
                 
                 fig.update_layout(title=f"Continuous Visual for {selected_ticker}", yaxis_title="Stock Price ($)", template="plotly_dark", height=700, xaxis_rangeslider_visible=True)
                 st.plotly_chart(fig, use_container_width=True)
