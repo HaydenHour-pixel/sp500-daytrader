@@ -40,16 +40,24 @@ if not os.path.exists(TRADE_FILE) or os.stat(TRADE_FILE).st_size == 0:
     st.info("ℹ️ No trade data found yet. Your cockpit will automatically populate once `trade_log.csv` records its first closed positions on Monday!")
 else:
     # Read the local trade history ledger
-    df_trades = pd.read_csv(TRADE_FILE)
+    # Read and sanitize immediately
+    df_raw = pd.read_csv(TRADE_FILE)
     
-    # Filter to only show closed trades that have an entry and exit
-    df_closed = df_trades[df_trades['Status'] == 'CLOSED'].copy()
+    # Force conversion with coerce to turn parsing errors into NaT/NaN
+    df_raw['Entry_Time'] = pd.to_datetime(df_raw['Entry_Time'], errors='coerce')
+    df_raw['Exit_Time'] = pd.to_datetime(df_raw['Exit_Time'], errors='coerce')
+    df_raw['PnL'] = pd.to_numeric(df_raw['PnL'], errors='coerce')
+    
+    # Drop rows that failed conversion or are missing critical data
+    df_clean = df_raw.dropna(subset=['Entry_Time', 'Exit_Time', 'PnL', 'Ticker'])
+    
+    # Filter to only show closed trades
+    df_closed = df_clean[df_clean['Status'] == 'CLOSED'].copy()
     
     if df_closed.empty:
-        st.warning("⚠️ Found a trade log, but there are no completed (CLOSED) trades to visualize yet.")
+        st.warning("⚠️ Found a trade log, but there are no valid, completed (CLOSED) trades to visualize.")
     else:
-        # Sort by exit time to build chronological sequence
-        df_closed['Exit_Time'] = pd.to_datetime(df_closed['Exit_Time'])
+        # Sort safely
         df_closed = df_closed.sort_values(by='Exit_Time').reset_index(drop=True)
         
         # Metrics Sidebar
@@ -179,14 +187,14 @@ else:
                     fig.add_trace(go.Scatter(
                         x=[entry_dt], y=[selected_trade['Entry_Price']], mode="markers+text",
                         marker=dict(symbol="triangle-up", color="#10B981", size=15, line=dict(color="white", width=1)),
-                        name="Buy Entry", text=[f"Buy Entry (${selected_trade['Entry_Price']:.2f})"], textposition="bottom center"
+                        name="Buy Entry", text=[f"Buy Entry (${float(selected_trade['Entry_Price']):.2f})"], textposition="bottom center"
                     ))
                     
                     # Sell Point Trace Marker
                     fig.add_trace(go.Scatter(
                         x=[exit_dt], y=[selected_trade['Exit_Price']], mode="markers+text",
                         marker=dict(symbol="triangle-down", color="#EF4444", size=15, line=dict(color="white", width=1)),
-                        name="Sell Exit", text=[f"Sell Exit (${selected_trade['Exit_Price']:.2f})"], textposition="top center"
+                        name="Sell Exit", text=[f"Sell Exit (${float(selected_trade['Exit_Price']):.2f})"], textposition="top center"
                     ))
                 
                 fig.update_layout(
