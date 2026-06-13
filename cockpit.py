@@ -203,7 +203,7 @@ else:
             st.markdown("Track continuous performance and asset execution vectors over a customizable historical horizon.")
             
             # =====================================================================
-            # 🏆 TICKER LEADERBOARD TRACKER COMPONENT (New)
+            # 🏆 TICKER LEADERBOARD TRACKER COMPONENT (New & Enhanced!)
             # =====================================================================
             with st.expander("🏆 Ticker Performance Leaderboard Tracker", expanded=True):
                 leaderboard_rows = []
@@ -216,12 +216,28 @@ else:
                     t_wr = (t_wins / t_count) * 100 if t_count > 0 else 0.0
                     t_expectancy = ticker_trades['PnL'].mean()
                     
+                    # Ultra Statistics Calculations
+                    best_trade = ticker_trades['PnL'].max()
+                    worst_trade = ticker_trades['PnL'].min()
+                    
+                    avg_win = ticker_trades[ticker_trades['PnL'] > 0]['PnL'].mean() if t_wins > 0 else 0.0
+                    avg_loss = ticker_trades[ticker_trades['PnL'] <= 0]['PnL'].mean() if t_losses > 0 else 0.0
+                    
+                    gross_wins = ticker_trades[ticker_trades['PnL'] > 0]['PnL'].sum()
+                    gross_losses = abs(ticker_trades[ticker_trades['PnL'] < 0]['PnL'].sum())
+                    profit_factor = gross_wins / gross_losses if gross_losses > 0 else (gross_wins if gross_wins > 0 else 1.0)
+                    
                     leaderboard_rows.append({
                         "Ticker": ticker,
                         "Total PnL": t_pnl,
                         "Trades": t_count,
                         "Win Rate": t_wr,
                         "Win/Loss Record": f"{t_wins}W - {t_losses}L",
+                        "Best Trade": best_trade,
+                        "Worst Trade": worst_trade,
+                        "Avg Win": avg_win,
+                        "Avg Loss": avg_loss,
+                        "Profit Factor": profit_factor,
                         "Expectancy (Avg/Trade)": t_expectancy
                     })
                 
@@ -251,6 +267,11 @@ else:
                         "Trades": st.column_config.NumberColumn("Completed Trades"),
                         "Win Rate": st.column_config.NumberColumn("Win Rate", format="%.1f%%"),
                         "Win/Loss Record": st.column_config.TextColumn("Record (W - L)"),
+                        "Best Trade": st.column_config.NumberColumn("🔥 Best Trade", format="$%,.2f", help="The largest single winning trade on this asset."),
+                        "Worst Trade": st.column_config.NumberColumn("❄️ Worst Trade", format="$%,.2f", help="The deepest single losing trade on this asset."),
+                        "Avg Win": st.column_config.NumberColumn("📈 Avg Win", format="$%,.2f", help="The average payout for winning trades."),
+                        "Avg Loss": st.column_config.NumberColumn("📉 Avg Loss", format="$%,.2f", help="The average cost for losing trades."),
+                        "Profit Factor": st.column_config.NumberColumn("📊 Profit Factor", format="%.2f", help="Gross Wins divided by Gross Losses. A value > 1.0 is historically profitable."),
                         "Expectancy (Avg/Trade)": st.column_config.NumberColumn("Avg Return/Trade", format="$%,.2f")
                     },
                     hide_index=True,
