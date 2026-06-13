@@ -11,16 +11,6 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 from dotenv import load_dotenv
 from bot_enhancements import get_high_volatility_tickers, calculate_trailing_stop, should_exit_trade
 
-def calculate_trailing_stop(current_price, entry_price, trailing_percent=0.005):
-    """Returns the dynamic trailing stop level."""
-    if current_price > entry_price:
-        return current_price * (1 - trailing_percent)
-    return entry_price * 0.99  # Static 1% stop if not in profit yet
-
-def should_exit_trade(current_price, trailing_stop_level):
-    """Returns True if the trailing stop is breached."""
-    return current_price <= trailing_stop_level
-
 # Load secure environment configurations
 load_dotenv()
 
