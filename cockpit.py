@@ -14,6 +14,23 @@ st.markdown("Use this visual utility to audit and review the entry and exit exec
 TRADE_FILE = "trade_log.csv"
 SUMMARY_FILE = "daily_summary.csv"
 
+# =====================================================================
+# INITIALIZE PERSISTENT STATE VARS (Unlinked to Widget Keys to Prevent Streamlit Deletion)
+# =====================================================================
+if "stored_single_selected_label" not in st.session_state:
+    st.session_state.stored_single_selected_label = None
+if "stored_single_buffer_choice" not in st.session_state:
+    st.session_state.stored_single_buffer_choice = "Standard Zoom (45m context)"
+if "stored_single_chart_style" not in st.session_state:
+    st.session_state.stored_single_chart_style = "Buy/Sell Arrows Only"
+
+if "stored_all_selected_ticker" not in st.session_state:
+    st.session_state.stored_all_selected_ticker = None
+if "stored_all_period_choice" not in st.session_state:
+    st.session_state.stored_all_period_choice = "5 Days (5m intervals)"
+if "stored_all_chart_style" not in st.session_state:
+    st.session_state.stored_all_chart_style = "Buy/Sell Arrows Only"
+
 # Check if trade log exists
 if not os.path.exists(TRADE_FILE) or os.stat(TRADE_FILE).st_size == 0:
     st.info("ℹ️ No trade data found yet. Your cockpit will automatically populate once `trade_log.csv` records its first closed positions on Monday!")
@@ -51,26 +68,45 @@ else:
             st.subheader("🔍 Audit Individual Executions")
             st.markdown("Inspect trade execution timelines matched against live minute candles.")
             
-            # Form-based filters for fine-tuned view controls
+            # Form dropdown helper lists
+            df_closed['dropdown_label'] = df_closed.apply(
+                lambda r: f"{r['Ticker']} | PnL: ${r['PnL']:+.2f} | {r['Entry_Time']}", axis=1
+            )
+            trade_labels = df_closed['dropdown_label'].tolist()
+            zoom_options = ["Tight Zoom (15m context)", "Standard Zoom (45m context)", "Wide Zoom (2h context)", "Show Full Day (Market Hours)"]
+            style_options = ["Buy/Sell Arrows Only", "Stock Graph Only", "Both (Stock Graph + Arrows)"]
+            
+            # Resolve State Defaults
+            if st.session_state.stored_single_selected_label not in trade_labels:
+                st.session_state.stored_single_selected_label = trade_labels[0]
+                
+            idx_label = trade_labels.index(st.session_state.stored_single_selected_label)
+            idx_zoom = zoom_options.index(st.session_state.stored_single_buffer_choice)
+            idx_style = style_options.index(st.session_state.stored_single_chart_style)
+
+            # Form-based filters with custom indexing to maintain state persistence
             col_sel1, col_sel2, col_sel3 = st.columns([2, 1, 1])
             with col_sel1:
-                # Format a clean dropdown label
-                df_closed['dropdown_label'] = df_closed.apply(
-                    lambda r: f"{r['Ticker']} | PnL: ${r['PnL']:+.2f} | {r['Entry_Time']}", axis=1
+                selected_label = st.selectbox(
+                    "Select a completed trade to plot:", 
+                    trade_labels, 
+                    index=idx_label
                 )
-                selected_label = st.selectbox("Select a completed trade to plot:", df_closed['dropdown_label'].tolist())
+                st.session_state.stored_single_selected_label = selected_label
             with col_sel2:
                 buffer_choice = st.selectbox(
-                    "Visual Zoom Level:",
-                    ["Tight Zoom (15m context)", "Standard Zoom (45m context)", "Wide Zoom (2h context)", "Show Full Day (Market Hours)"],
-                    index=1
+                    "Visual Zoom Level:", 
+                    zoom_options, 
+                    index=idx_zoom
                 )
+                st.session_state.stored_single_buffer_choice = buffer_choice
             with col_sel3:
                 chart_style = st.selectbox(
-                    "Chart Representation:",
-                    ["Buy/Sell Arrows Only", "Stock Graph Only", "Both (Stock Graph + Arrows)"],
-                    index=2  # Default to Both (Stock Graph + Arrows)
+                    "Chart Representation:", 
+                    style_options, 
+                    index=idx_style
                 )
+                st.session_state.stored_single_chart_style = chart_style
                 
             selected_trade = df_closed[df_closed['dropdown_label'] == selected_label].iloc[0]
             
@@ -166,24 +202,97 @@ else:
             st.subheader("📈 All-in-One Asset View")
             st.markdown("Track continuous performance and asset execution vectors over a customizable historical horizon.")
             
-            # Interactive horizon selectors
+            # =====================================================================
+            # 🏆 TICKER LEADERBOARD TRACKER COMPONENT (New)
+            # =====================================================================
+            with st.expander("🏆 Ticker Performance Leaderboard Tracker", expanded=True):
+                leaderboard_rows = []
+                for ticker in df_closed['Ticker'].unique():
+                    ticker_trades = df_closed[df_closed['Ticker'] == ticker]
+                    t_pnl = ticker_trades['PnL'].sum()
+                    t_count = len(ticker_trades)
+                    t_wins = (ticker_trades['PnL'] > 0).sum()
+                    t_losses = (ticker_trades['PnL'] <= 0).sum()
+                    t_wr = (t_wins / t_count) * 100 if t_count > 0 else 0.0
+                    t_expectancy = ticker_trades['PnL'].mean()
+                    
+                    leaderboard_rows.append({
+                        "Ticker": ticker,
+                        "Total PnL": t_pnl,
+                        "Trades": t_count,
+                        "Win Rate": t_wr,
+                        "Win/Loss Record": f"{t_wins}W - {t_losses}L",
+                        "Expectancy (Avg/Trade)": t_expectancy
+                    })
+                
+                # Sort descending by absolute PnL to establish competitive leaderboard ranks
+                df_leaderboard = pd.DataFrame(leaderboard_rows)
+                df_leaderboard = df_leaderboard.sort_values(by="Total PnL", ascending=False).reset_index(drop=True)
+                
+                # Format rankings with custom leaderboard trophies
+                df_leaderboard.insert(0, "Rank", "")
+                for idx in range(len(df_leaderboard)):
+                    rank_pos = idx + 1
+                    if rank_pos == 1:
+                        df_leaderboard.at[idx, "Rank"] = "🥇 1st"
+                    elif rank_pos == 2:
+                        df_leaderboard.at[idx, "Rank"] = "🥈 2nd"
+                    elif rank_pos == 3:
+                        df_leaderboard.at[idx, "Rank"] = "🥉 3rd"
+                    else:
+                        df_leaderboard.at[idx, "Rank"] = f"   {rank_pos}th"
+                
+                st.dataframe(
+                    df_leaderboard,
+                    column_config={
+                        "Rank": st.column_config.TextColumn("Leaderboard Rank", help="Performance placement based on total net profits."),
+                        "Ticker": st.column_config.TextColumn("Stock Ticker"),
+                        "Total PnL": st.column_config.NumberColumn("Total Net PnL", format="$%,.2f", help="Sum of all closed trade net gains or losses."),
+                        "Trades": st.column_config.NumberColumn("Completed Trades"),
+                        "Win Rate": st.column_config.NumberColumn("Win Rate", format="%.1f%%"),
+                        "Win/Loss Record": st.column_config.TextColumn("Record (W - L)"),
+                        "Expectancy (Avg/Trade)": st.column_config.NumberColumn("Avg Return/Trade", format="$%,.2f")
+                    },
+                    hide_index=True,
+                    use_container_width=True
+                )
+            
+            # Form options lists
+            unique_tickers = sorted(df_closed['Ticker'].unique())
+            horizon_options = ["1 Day (1m intervals)", "5 Days (5m intervals)", "1 Month (15m intervals)", "3 Months (1h intervals)", "6 Months (Daily intervals)"]
+            style_options = ["Buy/Sell Arrows Only", "Stock Graph Only", "Both (Stock Graph + Arrows)"]
+            
+            # Resolve State Defaults
+            if st.session_state.stored_all_selected_ticker not in unique_tickers:
+                st.session_state.stored_all_selected_ticker = unique_tickers[0]
+                
+            idx_ticker = unique_tickers.index(st.session_state.stored_all_selected_ticker)
+            idx_horizon = horizon_options.index(st.session_state.stored_all_period_choice)
+            idx_all_style = style_options.index(st.session_state.stored_all_chart_style)
+
+            # Interactive horizon selectors using unlinked index lookup logic
             col_sel1, col_sel2, col_sel3 = st.columns([2, 1, 1])
             with col_sel1:
-                unique_tickers = sorted(df_closed['Ticker'].unique())
-                selected_ticker = st.selectbox("Select a Stock to Analyze:", unique_tickers)
+                selected_ticker = st.selectbox(
+                    "Select a Stock to Analyze:", 
+                    unique_tickers, 
+                    index=idx_ticker
+                )
+                st.session_state.stored_all_selected_ticker = selected_ticker
             with col_sel2:
                 period_choice = st.selectbox(
-                    "Historical Chart Horizon:",
-                    ["1 Day (1m intervals)", "5 Days (5m intervals)", "1 Month (15m intervals)", "3 Months (1h intervals)", "6 Months (Daily intervals)"],
-                    index=1  # Default to 5 Days
+                    "Historical Chart Horizon:", 
+                    horizon_options, 
+                    index=idx_horizon
                 )
+                st.session_state.stored_all_period_choice = period_choice
             with col_sel3:
                 all_chart_style = st.selectbox(
-                    "Chart Representation:",
-                    ["Buy/Sell Arrows Only", "Stock Graph Only", "Both (Stock Graph + Arrows)"],
-                    index=2,  # Default to Both (Stock Graph + Arrows)
-                    key="all_in_one_chart_style"
+                    "Chart Representation:", 
+                    style_options, 
+                    index=idx_all_style
                 )
+                st.session_state.stored_all_chart_style = all_chart_style
             
             ticker_trades = df_closed[df_closed['Ticker'] == selected_ticker].copy()
             
