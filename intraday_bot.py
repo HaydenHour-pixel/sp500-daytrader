@@ -105,14 +105,26 @@ class AlphaHardTargetScalper:
             rsi_threshold -= 3.0  # Dynamic midday lull tightening (24.0)
         return current_rsi <= rsi_threshold
 
-    def _log_trade_entry(self, trade_id, ticker, qty, price, engine_used):
-        """Saves a pending position entry to local sheets."""
-        df = pd.read_csv(TRADE_FILE, dtype={"Entry_Time": str, "Exit_Time": str, "Status": str, "Trade_ID": str, "Engine": str})
+    def _log_trade_entry(self, trade_id, ticker, qty, price, engine_used, rsi_at_entry):
+        """Saves a pending position entry along with the decision context (RSI/Engine) for future AI training."""
+        # Ensure the header includes RSI_At_Entry if creating the file for the first time
+        df = pd.read_csv(TRADE_FILE)
+        
         new_row = {
-            "Trade_ID": str(trade_id), "Ticker": ticker, "Type": "LONG", "Qty": int(qty),
-            "Entry_Time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "Entry_Price": round(float(price), 2),
-            "Exit_Time": "", "Exit_Price": "", "PnL": 0.0, "Status": "OPEN", "Engine": engine_used
+            "Trade_ID": str(trade_id), 
+            "Ticker": ticker, 
+            "Type": "LONG", 
+            "Qty": int(qty),
+            "Entry_Time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 
+            "Entry_Price": round(float(price), 2),
+            "RSI_At_Entry": round(float(rsi_at_entry), 2), # New AI Context
+            "Engine": engine_used,                         # New AI Context
+            "Exit_Time": "", 
+            "Exit_Price": "", 
+            "PnL": 0.0, 
+            "Status": "OPEN"
         }
+        
         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
         df.to_csv(TRADE_FILE, index=False)
 
@@ -286,7 +298,9 @@ class AlphaHardTargetScalper:
                         if qty > 0 and allocated_cash <= live_buying_power:
                             trade_id = f"tr_{int(time.time())}"
                             if self.execute_order(ticker, qty, OrderSide.BUY):
-                                self._log_trade_entry(trade_id, ticker, qty, current_price, active_engine)
+                                # Calculate RSI here before logging
+                                rsi = self.calculate_rsi(ticker_df)
+                                self._log_trade_entry(trade_id, ticker, qty, current_price, active_engine, rsi)
                                 send_slack_alert(
                                     f"🚀 *Position Opened ({ticker})*\n"
                                     f"• Action: *BUY*\n"
