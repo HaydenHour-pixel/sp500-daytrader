@@ -324,24 +324,28 @@ class AlphaHardTargetScalper:
             return False
 
 if __name__ == "__main__":
-    # Dynamically scan the top 5 most volatile tickers
     print("🔍 Pre-Market Scan: Identifying high-volatility assets...")
     TICKER_SQUAD = get_high_volatility_tickers(list(TICKER_CONFIGS.keys()))
     print(f"✅ Scanning complete. Trading today: {TICKER_SQUAD}")
 
     bot = AlphaHardTargetScalper()
     
+    print("🚀 Starting main trading loop...") # Added this
     while True:
         try:
             clock = bot.client.get_clock()
             if not clock.is_open:
-                print("🛑 Market is closed. Shutting down active loop.")
-                send_slack_alert("🛑 *Market is Closed.* Volatility Scalper bot has run down its active loop execution sequence.")
-                break
+                print("🛑 Market is closed. Waiting for open...")
+                time.sleep(60) # Don't break, just wait
+                continue
                 
+            print(f"🔄 Executing pipeline at {datetime.now().strftime('%H:%M:%S')}") # Added this
             bot.execute_scalp_pipeline()
             time.sleep(30)
+            
         except Exception as e:
             print(f"⚠️ Main loop exception: {e}")
-            send_slack_alert(f"🚨 *Critical Runtime Exception Encountered!*\n```{str(e)}```")
+            import traceback
+            traceback.print_exc() # This will show you exactly which line is failing
+            send_slack_alert(f"🚨 *Critical Exception:*\n```{str(e)}```")
             time.sleep(30)
