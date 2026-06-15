@@ -100,7 +100,7 @@ class AlphaHardTargetScalper:
 
     def check_buy_signal(self, current_rsi: float) -> bool:
         """Unified, standardized rsi floor logic."""
-        rsi_threshold = 27.0
+        rsi_threshold = 40.0
         if self.get_active_engine() == "ENGINE_B":
             rsi_threshold -= 3.0  # Dynamic midday lull tightening (24.0)
         return current_rsi <= rsi_threshold
@@ -257,19 +257,16 @@ class AlphaHardTargetScalper:
                     alpaca_position = next(pos for pos in positions if pos.symbol == ticker)
                     avg_entry_price = float(alpaca_position.avg_entry_price)
                     
-                    # Calculate dynamic levels
                     trailing_level = calculate_trailing_stop(current_price, avg_entry_price)
                     atr = self.calculate_atr(ticker_df)
                     target_tp = avg_entry_price + (atr * 2.0) 
 
-                    # Execute exit if trailing stop is breached OR profit target reached
                     if current_price >= target_tp or should_exit_trade(current_price, trailing_level):
                         if self.execute_order(ticker, portfolio[ticker], OrderSide.SELL):
                             self.in_flight_sales.add(ticker)
                             self._log_trade_exit(ticker, portfolio[ticker], current_price)
                         continue
                         
-                    # Backup RSI exit
                     rsi = self.calculate_rsi(ticker_df)
                     if rsi >= 72:
                         if self.execute_order(ticker, portfolio[ticker], OrderSide.SELL):
@@ -277,41 +274,41 @@ class AlphaHardTargetScalper:
                             self._log_trade_exit(ticker, portfolio[ticker], current_price)
 
                 # =========================================================
-                # PASS 2: ENTRIES ON OVEREXTENDED RSI DISCHARGE
+                # PASS 2: TREND-AWARE ENTRY (Buying the dip in an uptrend)
                 # =========================================================
                 elif not is_holding:
                     if market_close_imminent: continue
                         
                     rsi = self.calculate_rsi(ticker_df)
+                    short_ma = ticker_df['Close'].rolling(window=5).mean().iloc[-1]
                     
-                    if self.check_buy_signal(rsi):
+                    # Entry logic: RSI cool-off (<= 50) + Bullish Price Trend (Price > MA)
+                    if rsi <= 50.0 and current_price > short_ma:
                         try:
                             current_account = self.client.get_account()
                             live_buying_power = float(current_account.buying_power)
-                        except Exception:
-                            continue
-
-                        config = TICKER_CONFIGS.get(ticker, {"max_share_allocation": 0.10})
-                        allocated_cash = live_buying_power * config["max_share_allocation"]
-                        qty = int(allocated_cash // current_price)
-                        
-                        if qty > 0 and allocated_cash <= live_buying_power:
-                            trade_id = f"tr_{int(time.time())}"
-                            if self.execute_order(ticker, qty, OrderSide.BUY):
-                                # Calculate RSI here before logging
-                                rsi = self.calculate_rsi(ticker_df)
-                                self._log_trade_entry(trade_id, ticker, qty, current_price, active_engine, rsi)
-                                send_slack_alert(
-                                    f"🚀 *Position Opened ({ticker})*\n"
-                                    f"• Action: *BUY*\n"
-                                    f"• Shares: {qty}\n"
-                                    f"• Price: ${current_price:.2f}\n"
-                                    f"• Sizing: {config['max_share_allocation'] * 100:.1f}% portfolio allocation\n"
-                                    f"• Engine: {active_engine}"
-                                )
-                                
+                            
+                            config = TICKER_CONFIGS.get(ticker, {"max_share_allocation": 0.10})
+                            allocated_cash = live_buying_power * config["max_share_allocation"]
+                            qty = int(allocated_cash // current_price)
+                            
+                            if qty > 0 and allocated_cash <= live_buying_power:
+                                trade_id = f"tr_{int(time.time())}"
+                                if self.execute_order(ticker, qty, OrderSide.BUY):
+                                    self._log_trade_entry(trade_id, ticker, qty, current_price, active_engine, rsi)
+                                    send_slack_alert(
+                                        f"🚀 *Position Opened ({ticker})*\n"
+                                        f"• Action: *BUY (Trend-Aware)*\n"
+                                        f"• Shares: {qty}\n"
+                                        f"• Price: ${current_price:.2f}\n"
+                                        f"• RSI at Entry: {rsi:.1f}\n"
+                                        f"• Engine: {active_engine}"
+                                    )
+                        except Exception as e:
+                            print(f"❌ Processing error on asset {ticker}: {e}")
+                            
             except Exception as e:
-                print(f"❌ Processing error on asset {ticker}: {e}")
+                print(f"❌ Critical loop error on asset {ticker}: {e}")
 
     def execute_order(self, ticker, qty, side):
         try:
