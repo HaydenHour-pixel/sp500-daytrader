@@ -1,7 +1,7 @@
 import os
 import time
 import requests
-from datetime import datetime, time as datetime_time
+from datetime import datetime, time as datetime_time, timedelta
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -57,6 +57,8 @@ class AlphaHardTargetScalper:
         self.ticker_pnl = {ticker: 0.0 for ticker in TICKER_SQUAD}
         self.daily_wins = 0
         self.daily_losses = 0
+        self.last_trade_results = {} # Tracks {ticker: {"time": datetime, "pnl": float}}
+        self.volatility_base = 0.005 # Baseline 0.5% ATR target
         
         self._initialize_csv_files()
         self._hydrate_state_from_csv()
@@ -139,6 +141,12 @@ class AlphaHardTargetScalper:
         entry_price = float(df.loc[idx, 'Entry_Price'])
         trade_pnl = round((round(float(price), 2) - entry_price) * int(qty), 2)
         
+        # --- NEW: TRACK RESULT FOR COOLDOWN LOGIC ---
+        self.last_trade_results[ticker] = {
+            "time": datetime.now(),
+            "pnl": float(trade_pnl)
+        }
+        
         df.at[idx, 'Exit_Time'] = str(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
         df.at[idx, 'Exit_Price'] = round(float(price), 2)
         df.at[idx, 'PnL'] = float(trade_pnl)
@@ -155,7 +163,6 @@ class AlphaHardTargetScalper:
             
         self._update_daily_summary()
         
-        # Push notification details to Slack workspace
         send_slack_alert(
             f"⚖️ *Position Closed ({ticker})*\n"
             f"• Result: {outcome_emoji}\n"
@@ -273,23 +280,35 @@ class AlphaHardTargetScalper:
                             self.in_flight_sales.add(ticker)
                             self._log_trade_exit(ticker, portfolio[ticker], current_price)
 
-                # =========================================================
-                # PASS 2: TREND-AWARE ENTRY (Buying the dip in an uptrend)
-                # =========================================================
+                # --- PASS 2: ENTRY WITH COOL-DOWN AND VOLATILITY SIZING ---
                 elif not is_holding:
                     if market_close_imminent: continue
-                        
+
+                    # 1. COOL-DOWN CHECK (Penalty Box)
+                    if ticker in self.last_trade_results:
+                        last_trade = self.last_trade_results[ticker]
+                        if last_trade['pnl'] < 0: # Only cooldown on losses
+                            if datetime.now() - last_trade['time'] < timedelta(minutes=15):
+                                continue 
+
+                    # 2. CALCULATE ATR FOR SIZING
                     rsi = self.calculate_rsi(ticker_df)
+                    current_atr = self.calculate_atr(ticker_df)
                     short_ma = ticker_df['Close'].rolling(window=5).mean().iloc[-1]
                     
-                    # Entry logic: RSI cool-off (<= 50) + Bullish Price Trend (Price > MA)
                     if rsi <= 50.0 and current_price > short_ma:
                         try:
+                            # 3. VOLATILITY-ADJUSTED SIZING
+                            # If ATR is high (high volatility), reduce position size
+                            atr_ratio = (current_atr / current_price) / self.volatility_base
+                            vol_adjustment = min(1.0, 1.0 / atr_ratio) 
+                            
                             current_account = self.client.get_account()
                             live_buying_power = float(current_account.buying_power)
                             
                             config = TICKER_CONFIGS.get(ticker, {"max_share_allocation": 0.10})
-                            allocated_cash = live_buying_power * config["max_share_allocation"]
+                            allocated_cash = live_buying_power * (config["max_share_allocation"] * vol_adjustment)
+                            
                             qty = int(allocated_cash // current_price)
                             
                             if qty > 0 and allocated_cash <= live_buying_power:
@@ -321,28 +340,25 @@ class AlphaHardTargetScalper:
             return False
 
 if __name__ == "__main__":
-    print("🔍 Pre-Market Scan: Identifying high-volatility assets...")
-    TICKER_SQUAD = get_high_volatility_tickers(list(TICKER_CONFIGS.keys()))
-    print(f"✅ Scanning complete. Trading today: {TICKER_SQUAD}")
-
     bot = AlphaHardTargetScalper()
+    print(f"🚀 Bot armed and monitoring {len(TICKER_SQUAD)} assets...")
     
-    print("🚀 Starting main trading loop...") # Added this
+    # 09:30 AM to 04:00 PM EST market window
+    market_open = datetime_time(9, 30)
+    market_close = datetime_time(16, 0)
+
     while True:
-        try:
-            clock = bot.client.get_clock()
-            if not clock.is_open:
-                print("🛑 Market is closed. Waiting for open...")
-                time.sleep(60) # Don't break, just wait
-                continue
-                
-            print(f"🔄 Executing pipeline at {datetime.now().strftime('%H:%M:%S')}") # Added this
-            bot.execute_scalp_pipeline()
-            time.sleep(30)
+        now = datetime.now().time()
+        
+        # Check if we are inside market hours
+        if market_open <= now <= market_close:
+            try:
+                bot.execute_scalp_pipeline()
+            except Exception as e:
+                print(f"⚠️ Loop interruption: {e}. Resuming in 60s...")
             
-        except Exception as e:
-            print(f"⚠️ Main loop exception: {e}")
-            import traceback
-            traceback.print_exc() # This will show you exactly which line is failing
-            send_slack_alert(f"🚨 *Critical Exception:*\n```{str(e)}```")
-            time.sleep(30)
+            # Throttle the loop to prevent excessive API hits
+            time.sleep(60) 
+        else:
+            # Outside hours, wait 5 minutes before checking if market is open
+            time.sleep(300)
