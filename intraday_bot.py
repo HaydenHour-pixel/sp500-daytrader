@@ -100,11 +100,17 @@ class AlphaHardTargetScalper:
         lull_end = datetime_time(13, 30)
         return "ENGINE_B" if lull_start <= current_time < lull_end else "ENGINE_A"
 
-    def check_buy_signal(self, current_rsi: float) -> bool:
-        """Unified, standardized rsi floor logic."""
+    def check_buy_signal(self, current_rsi: float, current_volatility: float) -> bool:
+        """Adaptive RSI: Allows higher entries during high volatility (Momentum mode)."""
+        # Base threshold
         rsi_threshold = 40.0
         if self.get_active_engine() == "ENGINE_B":
-            rsi_threshold -= 3.0  # Dynamic midday lull tightening (24.0)
+            rsi_threshold -= 3.0
+            
+        # If volatility is high (momentum is strong), allow entry up to 55 RSI
+        if current_volatility > self.volatility_base * 2:
+            rsi_threshold = 55.0
+            
         return current_rsi <= rsi_threshold
 
     def _log_trade_entry(self, trade_id, ticker, qty, price, engine_used, rsi_at_entry):
@@ -258,51 +264,56 @@ class AlphaHardTargetScalper:
                     self.in_flight_sales.remove(ticker)
 
                 # =========================================================
-                # PASS 1: EXITS WITH TRAILING STOP AND PROFIT TARGET
+                # PASS 1: PARTIAL EXIT (50/50 Strategy)
                 # =========================================================
                 if is_holding and ticker not in self.in_flight_sales:
                     alpaca_position = next(pos for pos in positions if pos.symbol == ticker)
-                    avg_entry_price = float(alpaca_position.avg_entry_price)
+                    avg_entry = float(alpaca_position.avg_entry_price)
+                    qty = int(alpaca_position.qty)
                     
-                    trailing_level = calculate_trailing_stop(current_price, avg_entry_price)
+                    # Use a slightly closer target for the partial exit
                     atr = self.calculate_atr(ticker_df)
-                    target_tp = avg_entry_price + (atr * 2.0) 
+                    target_tp_partial = avg_entry + (atr * 1.0) 
+                    trailing_level = calculate_trailing_stop(current_price, avg_entry)
 
-                    if current_price >= target_tp or should_exit_trade(current_price, trailing_level):
-                        if self.execute_order(ticker, portfolio[ticker], OrderSide.SELL):
-                            self.in_flight_sales.add(ticker)
-                            self._log_trade_exit(ticker, portfolio[ticker], current_price)
+                    # 1. Partial Profit Taking (Sell 50%)
+                    if current_price >= target_tp_partial and qty > 1:
+                        sell_qty = qty // 2
+                        if self.execute_order(ticker, sell_qty, OrderSide.SELL):
+                            self._log_trade_exit(ticker, sell_qty, current_price)
+                            send_slack_alert(f"💰 *Partial Exit ({ticker})*: Locked in 50% gains.")
                         continue
-                        
-                    rsi = self.calculate_rsi(ticker_df)
-                    if rsi >= 72:
-                        if self.execute_order(ticker, portfolio[ticker], OrderSide.SELL):
-                            self.in_flight_sales.add(ticker)
-                            self._log_trade_exit(ticker, portfolio[ticker], current_price)
 
-                # --- PASS 2: ENTRY WITH COOL-DOWN AND VOLATILITY SIZING ---
+                    # 2. Final Exit (Trailing Stop or 2.5x ATR Target)
+                    target_tp_final = avg_entry + (atr * 2.5)
+                    if current_price >= target_tp_final or should_exit_trade(current_price, trailing_level):
+                        if self.execute_order(ticker, qty, OrderSide.SELL):
+                            self.in_flight_sales.add(ticker)
+                            self._log_trade_exit(ticker, qty, current_price)
+                        continue
+
+                # PASS 2: ADAPTIVE ENTRY
                 elif not is_holding:
                     if market_close_imminent: continue
 
-                    # 1. COOL-DOWN CHECK (Penalty Box)
+                    # 1. COOLDOWN CHECK
                     if ticker in self.last_trade_results:
                         last_trade = self.last_trade_results[ticker]
-                        if last_trade['pnl'] < 0: # Only cooldown on losses
-                            if datetime.now() - last_trade['time'] < timedelta(minutes=15):
-                                continue 
+                        if last_trade['pnl'] < 0 and (datetime.now() - last_trade['time'] < timedelta(minutes=15)):
+                            continue 
 
-                    # 2. CALCULATE ATR FOR SIZING
+                    # 2. ADAPTIVE METRICS
                     rsi = self.calculate_rsi(ticker_df)
                     current_atr = self.calculate_atr(ticker_df)
-                    short_ma = ticker_df['Close'].rolling(window=5).mean().iloc[-1]
                     
-                    if rsi <= 50.0 and current_price > short_ma:
+                    # Check Buy Signal using the new Adaptive logic
+                    if self.check_buy_signal(rsi, current_atr):
                         try:
-                            # 3. VOLATILITY-ADJUSTED SIZING
-                            # If ATR is high (high volatility), reduce position size
+                            # Volatility-Adjusted Sizing
                             atr_ratio = (current_atr / current_price) / self.volatility_base
-                            vol_adjustment = min(1.0, 1.0 / atr_ratio) 
+                            vol_adjustment = min(1.5, 1.0 / atr_ratio) 
                             
+                            # Ensure we have a valid buying power
                             current_account = self.client.get_account()
                             live_buying_power = float(current_account.buying_power)
                             
@@ -311,21 +322,17 @@ class AlphaHardTargetScalper:
                             
                             qty = int(allocated_cash // current_price)
                             
-                            if qty > 0 and allocated_cash <= live_buying_power:
+                            if qty > 0:
                                 trade_id = f"tr_{int(time.time())}"
                                 if self.execute_order(ticker, qty, OrderSide.BUY):
                                     self._log_trade_entry(trade_id, ticker, qty, current_price, active_engine, rsi)
-                                    send_slack_alert(
-                                        f"🚀 *Position Opened ({ticker})*\n"
-                                        f"• Action: *BUY (Trend-Aware)*\n"
-                                        f"• Shares: {qty}\n"
-                                        f"• Price: ${current_price:.2f}\n"
-                                        f"• RSI at Entry: {rsi:.1f}\n"
-                                        f"• Engine: {active_engine}"
-                                    )
+                                    send_slack_alert(f"🚀 *Position Opened ({ticker})*: RSI {rsi:.1f}, Qty {qty}")
+                        
                         except Exception as e:
-                            print(f"❌ Processing error on asset {ticker}: {e}")
-                            
+                            # This catch block resolves the syntax error
+                            print(f"❌ Error during sizing or execution for {ticker}: {e}")
+                            continue
+            
             except Exception as e:
                 print(f"❌ Critical loop error on asset {ticker}: {e}")
 
