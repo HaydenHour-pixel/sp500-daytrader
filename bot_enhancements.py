@@ -1,4 +1,5 @@
 import yfinance as yf
+import pandas as pd
 
 # --- 1. PRE-MARKET VOLATILITY SCANNER ---
 def get_high_volatility_tickers(ticker_list, window=5):
@@ -7,12 +8,19 @@ def get_high_volatility_tickers(ticker_list, window=5):
     for ticker in ticker_list:
         try:
             data = yf.download(ticker, period="1mo", interval="1d", progress=False)
+
+            # Fix for multi-index columns in newer yfinance versions
+            if isinstance(data.columns, pd.MultiIndex):
+                data.columns = data.columns.get_level_values(0)
+                
             if not data.empty:
-                # Calculate volatility as % change range
-                vol = ((data['High'] - data['Low']) / data['Close']).mean()
-                volatility_scores[ticker] = vol
-        except:
+                # Calculate volatility using .values for raw numeric processing
+                vol = ((data['High'].values - data['Low'].values) / data['Close'].values).mean()
+                volatility_scores[ticker] = float(vol)
+        except Exception as e:
+            print(f"⚠️ Volatility scan error for {ticker}: {e}")
             continue
+            
     # Return top 5 most volatile tickers
     sorted_tickers = sorted(volatility_scores, key=volatility_scores.get, reverse=True)
     return sorted_tickers[:5]
