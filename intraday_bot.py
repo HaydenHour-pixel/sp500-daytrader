@@ -1,5 +1,6 @@
 import os
 import time
+import sys
 import requests
 from datetime import datetime, time as datetime_time, timedelta
 import pandas as pd
@@ -220,6 +221,21 @@ class AlphaHardTargetScalper:
 
     def execute_scalp_pipeline(self):
         now = datetime.now()
+        
+        # --- NEW: HARD STOP FOR MARKET HOURS ---
+        # US Markets close at 16:00. 
+        # If it's past 16:00, we force the bot to stop executing.
+        is_market_open = (now.hour == 9 and now.minute >= 30) or (10 <= now.hour < 16)
+        
+        if not is_market_open:
+            if now.hour < 16: # It's before market open
+                print(f"⏰ Market hasn't opened yet ({now.strftime('%H:%M')}). Waiting...")
+                time.sleep(60) # Sleep for a minute before checking again
+                return
+            else: # Market is closed for the day
+                print(f"😴 Market is closed ({now.strftime('%H:%M')}). Terminating...")
+                sys.exit(0)
+
         active_engine = self.get_active_engine()
         
         market_close_imminent = now.hour == 15 and now.minute >= 45
