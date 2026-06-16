@@ -51,13 +51,26 @@ else:
     # Drop rows that failed conversion or are missing critical data
     df_clean = df_raw.dropna(subset=['Entry_Time', 'Exit_Time', 'PnL', 'Ticker'])
     
-    # Filter to only show closed trades
-    df_closed = df_clean[df_clean['Status'] == 'CLOSED'].copy()
+    # Group by Trade_ID to collapse partial exits into one summary trade
+    trade_summary = df_clean.groupby('Trade_ID').agg({
+        'PnL': 'sum',
+        'Ticker': 'first',
+        'Entry_Time': 'first',
+        'Exit_Time': 'max',
+        'Qty': 'sum',
+        'Status': 'first',
+        'Entry_Price': 'mean', # Average price of legs
+        'Exit_Price': 'mean',  # Average price of legs
+        'Engine': 'first'
+    }).reset_index()
+
+    # Filter 'trade_summary' (the collapsed version), NOT 'df_clean' (the raw version)
+    df_closed = trade_summary[trade_summary['Status'] == 'CLOSED'].copy()
     
     if df_closed.empty:
-        st.warning("⚠️ Found a trade log, but there are no valid, completed (CLOSED) trades to visualize.")
+        st.warning("⚠️ No valid, completed (CLOSED) trades to visualize.")
     else:
-        # Sort safely
+        # Sort and proceed...
         df_closed = df_closed.sort_values(by='Exit_Time').reset_index(drop=True)
         
         # Metrics Sidebar
