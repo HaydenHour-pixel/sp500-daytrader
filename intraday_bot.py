@@ -188,17 +188,12 @@ class AlphaHardTargetScalper:
         # Calculate total trade PnL for the final alert
         all_exits_pnl = df[(df['Trade_ID'] == trade_id) & (df['Status'] == 'EXIT')]['PnL'].sum()
         
-        # 6. Update Win/Loss Stats ONLY on the final exit
+        # 6. Update status to CLOSED if final exit, then trigger summary refresh
         if is_final_exit:
             df.at[idx, 'Status'] = "CLOSED"
             df.to_csv(TRADE_FILE, index=False)
             
-            if all_exits_pnl > 0:
-                self.daily_wins += 1
-                outcome_emoji = "🟢 *WIN*"
-            else:
-                self.daily_losses += 1
-                outcome_emoji = "🔴 *LOSS*"
+            outcome_emoji = "🟢 *WIN*" if all_exits_pnl > 0 else "🔴 *LOSS*"
             
             message = (f"🏁 *Final Position Closed ({ticker})*\n"
                        f"• Result: {outcome_emoji}\n"
@@ -214,27 +209,40 @@ class AlphaHardTargetScalper:
         self._update_daily_summary()
 
     def _update_daily_summary(self):
-        """Saves current totals to local aggregated metrics dashboard sheets."""
-        df = pd.read_csv(SUMMARY_FILE)
-        total_pnl = round(sum(self.ticker_pnl.values()), 2)
+        """Refreshes summary metrics by reading the source-of-truth trade log."""
+        if not os.path.exists(TRADE_FILE): return
         
+        df = pd.read_csv(TRADE_FILE)
+        # Filter for today's data
+        today_trades = df[df['Entry_Time'].str.contains(self.today_str, na=False)]
+        
+        # Group by Trade_ID to treat multi-leg trades as single units
+        trade_summary = today_trades.groupby('Trade_ID')['PnL'].sum()
+        
+        # Re-calculate accurate totals
+        total_pnl = round(trade_summary.sum(), 2)
+        wins = int((trade_summary > 0).sum())
+        losses = int((trade_summary <= 0).sum())
+        
+        # Update summary file
+        summary_df = pd.read_csv(SUMMARY_FILE)
         summary_row = {
             "Date": self.today_str,
-            **{f"{t}_PnL": round(self.ticker_pnl[t], 2) for t in TICKER_SQUAD},
+            **{f"{t}_PnL": round(today_trades[today_trades['Ticker'] == t]['PnL'].sum(), 2) for t in TICKER_SQUAD},
             "Total_PnL": total_pnl,
-            "Wins": self.daily_wins,
-            "Losses": self.daily_losses
+            "Wins": wins,
+            "Losses": losses
         }
         
-        if not df.empty and self.today_str in df['Date'].values:
-            idx = df[df['Date'] == self.today_str].index[0]
+        if not summary_df.empty and self.today_str in summary_df['Date'].values:
+            idx = summary_df[summary_df['Date'] == self.today_str].index[0]
             for col, val in summary_row.items():
-                df.at[idx, col] = val
+                summary_df.at[idx, col] = val
         else:
-            df = pd.concat([df, pd.DataFrame([summary_row])], ignore_index=True)
+            summary_df = pd.concat([summary_df, pd.DataFrame([summary_row])], ignore_index=True)
             
-        df.to_csv(SUMMARY_FILE, index=False)
-        print(f"📊 Summary Sheet Synced | Session PnL: ${total_pnl:.2f} | {self.daily_wins}W-{self.daily_losses}L")
+        summary_df.to_csv(SUMMARY_FILE, index=False)
+        print(f"📊 Summary Sheet Synced | Total PnL: ${total_pnl:.2f} | {wins}W-{losses}L")
 
     def calculate_rsi(self, df):
         if len(df) < 20: return 50
@@ -257,50 +265,28 @@ class AlphaHardTargetScalper:
     def execute_scalp_pipeline(self):
         now = datetime.now()
         
-        # --- NEW: HARD STOP FOR MARKET HOURS ---
-        # US Markets close at 16:00. 
-        # If it's past 16:00, we force the bot to stop executing.
+        # 1. Market Hours Gatekeeper
         is_market_open = (now.hour == 9 and now.minute >= 30) or (10 <= now.hour < 16)
-        
         if not is_market_open:
-            if now.hour < 16: # It's before market open
-                print(f"⏰ Market hasn't opened yet ({now.strftime('%H:%M')}). Waiting...")
-                time.sleep(60) # Sleep for a minute before checking again
+            if now.hour < 16:
+                time.sleep(60)
                 return
-            else: # Market is closed for the day
-                print(f"😴 Market is closed ({now.strftime('%H:%M')}). Terminating...")
+            else:
                 sys.exit(0)
 
         active_engine = self.get_active_engine()
-        
         market_close_imminent = now.hour == 15 and now.minute >= 45
-        emergency_liquidation_zone = now.hour == 15 and now.minute >= 57
 
+        # 2. Fetch Portfolio and Market Data
         try:
             positions = self.client.get_all_positions()
             portfolio = {pos.symbol: int(pos.qty) for pos in positions}
         except Exception as e:
-            print(f"⚠️ Alpaca connection throttled: {e}. Bypassing this loop.")
-            return
-
-        # Power hour emergency safety stop
-        if emergency_liquidation_zone and len(positions) > 0:
-            send_slack_alert("🚨 *Power Hour Emergency Stop triggered. Clearing all outstanding risk positions.*")
-            for pos in positions:
-                if pos.symbol not in self.in_flight_sales:
-                    if self.execute_order(pos.symbol, int(pos.qty), OrderSide.SELL):
-                        self.in_flight_sales.add(pos.symbol)
-                        try:
-                            latest_price = float(self.client.get_stock_latest_bar(pos.symbol).close)
-                        except Exception:
-                            latest_price = float(pos.current_price) 
-                        self._log_trade_exit(pos.symbol, int(pos.qty), latest_price)
             return
 
         try:
-            shared_data = yf.download(TICKER_SQUAD, period="2d", interval="1m", group_by='ticker', progress=False, timeout=4)
+            shared_data = yf.download(TICKER_SQUAD, period="2d", interval="1m", group_by='ticker', progress=False, timeout=5)
         except Exception as e:
-            print(f"⚠️ Yahoo Finance historical payload delayed: {e}")
             return
 
         for ticker in TICKER_SQUAD:
@@ -311,89 +297,63 @@ class AlphaHardTargetScalper:
                 current_price = ticker_df['Close'].iloc[-1]
                 is_holding = ticker in portfolio
 
-                if not is_holding and ticker in self.in_flight_sales:
-                    self.in_flight_sales.remove(ticker)
-
-                # =========================================================
-                # PASS 1: PARTIAL EXIT (50/50 Strategy)
-                # =========================================================
+                # --- PASS 1: EXIT LOGIC ---
                 if is_holding and ticker not in self.in_flight_sales:
                     alpaca_position = next(pos for pos in positions if pos.symbol == ticker)
                     avg_entry = float(alpaca_position.avg_entry_price)
                     qty = int(alpaca_position.qty)
                     
-                    # Use a slightly closer target for the partial exit
-                    atr = self.calculate_atr(ticker_df)
-                    target_tp_partial = avg_entry + (atr * 1.0) 
-                    trailing_level = calculate_trailing_stop(current_price, avg_entry)
-
-                    # 1. Partial Profit Taking (Sell 50%)
-                    if current_price >= target_tp_partial and qty > 1:
-                        sell_qty = qty // 2
-                        if self.execute_order(ticker, sell_qty, OrderSide.SELL):
-                            self._log_trade_exit(ticker, sell_qty, current_price)
-                            send_slack_alert(f"💰 *Partial Exit ({ticker})*: Locked in 50% gains.")
-                        continue
-
-                    # 2. Final Exit (Trailing Stop or 2.5x ATR Target)
-                    target_tp_final = avg_entry + (atr * 2.5)
-                    if current_price >= target_tp_final or should_exit_trade(current_price, trailing_level):
+                    # GUARD: Close entire position if qty is too small to split (prevents "dust" trades)
+                    if qty < 5:
                         if self.execute_order(ticker, qty, OrderSide.SELL):
-                            self.in_flight_sales.add(ticker)
                             self._log_trade_exit(ticker, qty, current_price)
                         continue
 
-                # PASS 2: ADAPTIVE ENTRY
-                elif not is_holding:
-                    if market_close_imminent: continue
+                    atr = self.calculate_atr(ticker_df)
+                    target_tp_partial = avg_entry + (atr * 1.5) # Increased to 1.5 ATR for fewer triggers
+                    
+                    # Partial Exit (50%)
+                    if current_price >= target_tp_partial and qty >= 10:
+                        sell_qty = qty // 2
+                        if self.execute_order(ticker, sell_qty, OrderSide.SELL):
+                            self._log_trade_exit(ticker, sell_qty, current_price)
+                            send_slack_alert(f"💰 *Partial Exit ({ticker})*: Locked in gains. Sleeping for 30s.")
+                            time.sleep(30) # Cool down after partial exit
+                        continue
 
-                    # 1. COOLDOWN CHECK
+                    # Final Exit
+                    trailing_level = calculate_trailing_stop(current_price, avg_entry)
+                    if current_price >= (avg_entry + (atr * 3.0)) or should_exit_trade(current_price, trailing_level):
+                        if self.execute_order(ticker, qty, OrderSide.SELL):
+                            self.in_flight_sales.add(ticker)
+                            self._log_trade_exit(ticker, qty, current_price)
+                            time.sleep(30) # Cool down after full exit
+                        continue
+
+                # --- PASS 2: ADAPTIVE ENTRY ---
+                elif not is_holding and not market_close_imminent:
+                    # COOLDOWN: Wait 10 minutes if we just traded this ticker
                     if ticker in self.last_trade_results:
-                        last_trade = self.last_trade_results[ticker]
-                        if last_trade['pnl'] < 0 and (datetime.now() - last_trade['time'] < timedelta(minutes=15)):
-                            continue 
+                        if (datetime.now() - self.last_trade_results[ticker]['time']) < timedelta(minutes=10):
+                            continue
 
-                    # 2. ADAPTIVE METRICS
                     rsi = self.calculate_rsi(ticker_df)
                     current_atr = self.calculate_atr(ticker_df)
                     
                     if self.check_buy_signal(rsi, current_atr):
-                        try:
-                            # --- DYNAMIC STRENGTH-WEIGHTED SIZING ---
-                            # Calculate strength: distance from 5-period MA
-                            short_ma = ticker_df['Close'].rolling(window=5).mean().iloc[-1]
-                            price_distance = (current_price - short_ma) / short_ma 
-                            
-                            # Scale multiplier between 0.5x and 1.5x
-                            strength_multiplier = max(0.5, min(1.5, 1.0 + (price_distance * 10)))
-                            
-                            # Volatility adjustment
-                            atr_ratio = (current_atr / current_price) / self.volatility_base
-                            vol_adjustment = min(1.5, 1.0 / atr_ratio) 
-                            
-                            # Final allocation calculation
-                            current_account = self.client.get_account()
-                            live_buying_power = float(current_account.buying_power)
-                            
-                            config = TICKER_CONFIGS.get(ticker, {"max_share_allocation": 0.10})
-                            # Combine base config, strength momentum, and volatility adjustments
-                            dynamic_allocation = config["max_share_allocation"] * strength_multiplier * vol_adjustment
-                            allocated_cash = live_buying_power * dynamic_allocation
-                            
-                            qty = int(allocated_cash // current_price)
-                            
-                            if qty > 0:
-                                trade_id = f"tr_{int(time.time())}"
-                                if self.execute_order(ticker, qty, OrderSide.BUY):
-                                    self._log_trade_entry(trade_id, ticker, qty, current_price, active_engine, rsi)
-                                    send_slack_alert(f"🚀 *Position Opened ({ticker})*\nStrength Multiplier: {strength_multiplier:.2f}\nShares: {qty}")
+                        # Dynamic Sizing
+                        buy_power = float(self.client.get_account().buying_power)
+                        allocation = TICKER_CONFIGS.get(ticker, {"max_share_allocation": 0.05})["max_share_allocation"]
+                        qty = int((buy_power * allocation) // current_price)
                         
-                        except Exception as e:
-                            print(f"❌ Error during sizing or execution for {ticker}: {e}")
-                            continue
-            
+                        if qty > 0:
+                            if self.execute_order(ticker, qty, OrderSide.BUY):
+                                self._log_trade_entry(f"tr_{int(time.time())}", ticker, qty, current_price, active_engine, rsi)
+                                send_slack_alert(f"🚀 *Opened {ticker} ({qty} shares)*. Sleeping for 60s.")
+                                time.sleep(60) # Cool down after entry to let trend develop
+
             except Exception as e:
-                print(f"❌ Critical loop error on asset {ticker}: {e}")
+                print(f"❌ Execution error on {ticker}: {e}")
 
     def execute_order(self, ticker, qty, side):
         try:
