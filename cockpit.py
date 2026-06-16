@@ -48,21 +48,30 @@ else:
     df_raw['Exit_Time'] = pd.to_datetime(df_raw['Exit_Time'], errors='coerce')
     df_raw['PnL'] = pd.to_numeric(df_raw['PnL'], errors='coerce')
     
-    # Drop rows that failed conversion or are missing critical data
-    df_clean = df_raw.dropna(subset=['Entry_Time', 'Exit_Time', 'PnL', 'Ticker'])
+    # Only drop rows that are missing the critical identifiers (Trade_ID and Ticker)
+    # We keep Entry_Time and Exit_Time as they are, even if one is empty
+    df_clean = df_raw.dropna(subset=['Trade_ID', 'Ticker'])
     
-    # Group by Trade_ID to collapse partial exits into one summary trade
+    # Add this helper function before your groupby block
+    def get_final_status(series):
+        # If any leg is marked CLOSED, the whole trade is considered CLOSED
+        if 'CLOSED' in series.values:
+            return 'CLOSED'
+        return series.iloc[0]
+
+    # Now update your aggregation to use this function
     trade_summary = df_clean.groupby('Trade_ID').agg({
         'PnL': 'sum',
         'Ticker': 'first',
+        'Status': get_final_status, # Use the helper function here
         'Entry_Time': 'first',
         'Exit_Time': 'max',
         'Qty': 'sum',
-        'Status': 'first',
-        'Entry_Price': 'mean', # Average price of legs
-        'Exit_Price': 'mean',  # Average price of legs
+        'Entry_Price': 'mean',
+        'Exit_Price': 'mean',
         'Engine': 'first'
     }).reset_index()
+    
 
     # Filter 'trade_summary' (the collapsed version), NOT 'df_clean' (the raw version)
     df_closed = trade_summary[trade_summary['Status'] == 'CLOSED'].copy()
@@ -136,12 +145,18 @@ else:
                 )
                 st.session_state.stored_single_chart_style = chart_style
                 
-            selected_trade = df_closed[df_closed['dropdown_label'] == selected_label].iloc[0]
-            
-            # Parsing entry and exit timestamps
-            entry_dt = pd.to_datetime(selected_trade['Entry_Time'])
-            exit_dt = selected_trade['Exit_Time']
-            ticker = selected_trade['Ticker']
+            # Extract the ID from the selected trade summary
+            target_trade_id = df_closed[df_closed['dropdown_label'] == selected_label].iloc[0]['Trade_ID']
+
+            # Fetch ALL raw legs for this trade ID from the clean (raw) data
+            trade_legs = df_clean[df_clean['Trade_ID'] == target_trade_id]
+
+            selected_trade = trade_legs.iloc[0]
+
+            # Use the first/last of the raw legs for setting chart boundaries
+            entry_dt = trade_legs['Entry_Time'].min()
+            exit_dt = trade_legs['Exit_Time'].max()
+            ticker = trade_legs['Ticker'].iloc[0]
             
             # Translate the context selection into standard datetimes
             if buffer_choice == "Tight Zoom (15m context)":
@@ -194,21 +209,32 @@ else:
                         line=dict(color="#3B82F6", width=2), name=f"{ticker} Close Price"
                     ))
 
-                # 2. Buy/Sell Arrows (if Arrows are enabled)
+                # 2. Buy/Sell Arrows (Explicit Entry + Multiple Exits)
                 if chart_style in ["Buy/Sell Arrows Only", "Both (Stock Graph + Arrows)"]:
-                    # Buy Point Trace Marker
-                    fig.add_trace(go.Scatter(
-                        x=[entry_dt], y=[selected_trade['Entry_Price']], mode="markers+text",
-                        marker=dict(symbol="triangle-up", color="#10B981", size=15, line=dict(color="white", width=1)),
-                        name="Buy Entry", text=[f"Buy Entry (${float(selected_trade['Entry_Price']):.2f})"], textposition="bottom center"
-                    ))
+                    trade_legs = df_clean[df_clean['Trade_ID'] == target_trade_id].copy()
                     
-                    # Sell Point Trace Marker
-                    fig.add_trace(go.Scatter(
-                        x=[exit_dt], y=[selected_trade['Exit_Price']], mode="markers+text",
-                        marker=dict(symbol="triangle-down", color="#EF4444", size=15, line=dict(color="white", width=1)),
-                        name="Sell Exit", text=[f"Sell Exit (${float(selected_trade['Exit_Price']):.2f})"], textposition="top center"
-                    ))
+                    # Plot Entry (Only 1 row will have an Entry_Time)
+                    entry_df = trade_legs[trade_legs['Entry_Time'].notna()]
+                    if not entry_df.empty:
+                        entry_row = entry_df.iloc[0]
+                        fig.add_trace(go.Scatter(
+                            x=[entry_row['Entry_Time']], y=[entry_row['Entry_Price']],
+                            mode="markers+text",
+                            marker=dict(symbol="triangle-up", color="#10B981", size=14, line=dict(color="white", width=2)),
+                            name="Buy Entry", text=[f"Buy {entry_row['Qty']}"],
+                            textposition="bottom center", showlegend=False
+                        ))
+
+                    # Plot Exits (All rows that have an Exit_Time)
+                    exit_df = trade_legs[trade_legs['Exit_Time'].notna()]
+                    for _, row in exit_df.iterrows():
+                        fig.add_trace(go.Scatter(
+                            x=[row['Exit_Time']], y=[row['Exit_Price']],
+                            mode="markers+text",
+                            marker=dict(symbol="triangle-down", color="#EF4444", size=14, line=dict(color="white", width=2)),
+                            name="Sell Exit", text=[f"Exit {row['Qty']}<br>PnL: {row['PnL']}"],
+                            textposition="top center", showlegend=False
+                        ))
                 
                 fig.update_layout(
                     title=f"{ticker} Trade Audit Chart", yaxis_title="Stock Price ($)",

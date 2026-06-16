@@ -138,45 +138,80 @@ class AlphaHardTargetScalper:
         df.to_csv(TRADE_FILE, index=False)
 
     def _log_trade_exit(self, ticker, qty, price):
-        """Locates open trade, closes it out, logs statistics, and triggers alert updates."""
-        df = pd.read_csv(TRADE_FILE, dtype={"Entry_Time": str, "Exit_Time": str, "Status": str, "Trade_ID": str, "Engine": str})
+        """Appends a new EXIT row, updates stats, and sends context-aware Slack alerts."""
+        df = pd.read_csv(TRADE_FILE)
+        
+        # 1. Locate the corresponding OPEN trade
         open_mask = (df['Ticker'] == ticker) & (df['Status'] == 'OPEN')
         
-        if not open_mask.any(): return
+        if not open_mask.any():
+            print(f"⚠️ Warning: Attempted to log exit for {ticker} but no OPEN position found.")
+            return
             
         idx = df[open_mask].index[0]
+        trade_id = str(df.loc[idx, 'Trade_ID'])
         entry_price = float(df.loc[idx, 'Entry_Price'])
-        trade_pnl = round((round(float(price), 2) - entry_price) * int(qty), 2)
+        initial_qty = int(df.loc[idx, 'Qty'])
         
-        # --- NEW: TRACK RESULT FOR COOLDOWN LOGIC ---
-        self.last_trade_results[ticker] = {
-            "time": datetime.now(),
-            "pnl": float(trade_pnl)
+        # Calculate how much was already sold to determine if this is the final exit
+        previous_exits = df[(df['Trade_ID'] == trade_id) & (df['Status'] == 'EXIT')]['Qty'].sum()
+        remaining_qty = initial_qty - previous_exits
+        
+        # 2. Calculate PnL for this specific leg
+        leg_pnl = round((round(float(price), 2) - entry_price) * int(qty), 2)
+        
+        # 3. Create a NEW row for this Exit
+        exit_row = {
+            "Trade_ID": trade_id,
+            "Ticker": ticker,
+            "Type": "LONG",
+            "Qty": int(qty),
+            "Entry_Time": "",
+            "Entry_Price": "",
+            "Exit_Time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "Exit_Price": round(float(price), 2),
+            "PnL": float(leg_pnl),
+            "Status": "EXIT",
+            "Engine": df.loc[idx, 'Engine']
         }
         
-        df.at[idx, 'Exit_Time'] = str(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-        df.at[idx, 'Exit_Price'] = round(float(price), 2)
-        df.at[idx, 'PnL'] = float(trade_pnl)
-        df.at[idx, 'Status'] = "CLOSED"
+        df = pd.concat([df, pd.DataFrame([exit_row])], ignore_index=True)
         df.to_csv(TRADE_FILE, index=False)
         
-        self.ticker_pnl[ticker] += trade_pnl
-        if trade_pnl > 0:
-            self.daily_wins += 1
-            outcome_emoji = "🟢 *WIN*"
-        else:
-            self.daily_losses += 1
-            outcome_emoji = "🔴 *LOSS*"
-            
-        self._update_daily_summary()
+        # 4. Update bot memory
+        self.last_trade_results[ticker] = {"time": datetime.now(), "pnl": float(leg_pnl)}
+        self.ticker_pnl[ticker] += leg_pnl
         
-        send_slack_alert(
-            f"⚖️ *Position Closed ({ticker})*\n"
-            f"• Result: {outcome_emoji}\n"
-            f"• Trade PnL: *${trade_pnl:+.2f}*\n"
-            f"• Executed Price: ${price:.2f} (Avg Entry: ${entry_price:.2f})\n"
-            f"• Current Session Record: {self.daily_wins}W-{self.daily_losses}L"
-        )
+        # 5. Determine if this is the final closing exit
+        is_final_exit = (remaining_qty - qty) <= 0
+        
+        # Calculate total trade PnL for the final alert
+        all_exits_pnl = df[(df['Trade_ID'] == trade_id) & (df['Status'] == 'EXIT')]['PnL'].sum()
+        
+        # 6. Update Win/Loss Stats ONLY on the final exit
+        if is_final_exit:
+            df.at[idx, 'Status'] = "CLOSED"
+            df.to_csv(TRADE_FILE, index=False)
+            
+            if all_exits_pnl > 0:
+                self.daily_wins += 1
+                outcome_emoji = "🟢 *WIN*"
+            else:
+                self.daily_losses += 1
+                outcome_emoji = "🔴 *LOSS*"
+            
+            message = (f"🏁 *Final Position Closed ({ticker})*\n"
+                       f"• Result: {outcome_emoji}\n"
+                       f"• Exit Qty: {qty}\n"
+                       f"• This Leg PnL: *${leg_pnl:+.2f}*\n"
+                       f"• *Total Trade PnL: ${all_exits_pnl:+.2f}*")
+        else:
+            message = (f"💰 *Partial Exit Executed ({ticker})*\n"
+                       f"• Exit Qty: {qty}\n"
+                       f"• This Leg PnL: *${leg_pnl:+.2f}*")
+        
+        send_slack_alert(message)
+        self._update_daily_summary()
 
     def _update_daily_summary(self):
         """Saves current totals to local aggregated metrics dashboard sheets."""
