@@ -322,19 +322,28 @@ class AlphaHardTargetScalper:
                     rsi = self.calculate_rsi(ticker_df)
                     current_atr = self.calculate_atr(ticker_df)
                     
-                    # Check Buy Signal using the new Adaptive logic
                     if self.check_buy_signal(rsi, current_atr):
                         try:
-                            # Volatility-Adjusted Sizing
+                            # --- DYNAMIC STRENGTH-WEIGHTED SIZING ---
+                            # Calculate strength: distance from 5-period MA
+                            short_ma = ticker_df['Close'].rolling(window=5).mean().iloc[-1]
+                            price_distance = (current_price - short_ma) / short_ma 
+                            
+                            # Scale multiplier between 0.5x and 1.5x
+                            strength_multiplier = max(0.5, min(1.5, 1.0 + (price_distance * 10)))
+                            
+                            # Volatility adjustment
                             atr_ratio = (current_atr / current_price) / self.volatility_base
                             vol_adjustment = min(1.5, 1.0 / atr_ratio) 
                             
-                            # Ensure we have a valid buying power
+                            # Final allocation calculation
                             current_account = self.client.get_account()
                             live_buying_power = float(current_account.buying_power)
                             
                             config = TICKER_CONFIGS.get(ticker, {"max_share_allocation": 0.10})
-                            allocated_cash = live_buying_power * (config["max_share_allocation"] * vol_adjustment)
+                            # Combine base config, strength momentum, and volatility adjustments
+                            dynamic_allocation = config["max_share_allocation"] * strength_multiplier * vol_adjustment
+                            allocated_cash = live_buying_power * dynamic_allocation
                             
                             qty = int(allocated_cash // current_price)
                             
@@ -342,10 +351,9 @@ class AlphaHardTargetScalper:
                                 trade_id = f"tr_{int(time.time())}"
                                 if self.execute_order(ticker, qty, OrderSide.BUY):
                                     self._log_trade_entry(trade_id, ticker, qty, current_price, active_engine, rsi)
-                                    send_slack_alert(f"🚀 *Position Opened ({ticker})*: RSI {rsi:.1f}, Qty {qty}")
+                                    send_slack_alert(f"🚀 *Position Opened ({ticker})*\nStrength Multiplier: {strength_multiplier:.2f}\nShares: {qty}")
                         
                         except Exception as e:
-                            # This catch block resolves the syntax error
                             print(f"❌ Error during sizing or execution for {ticker}: {e}")
                             continue
             
