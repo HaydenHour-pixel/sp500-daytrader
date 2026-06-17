@@ -101,7 +101,7 @@ class AlphaHardTargetScalper:
         lull_end = datetime_time(13, 30)
         return "ENGINE_B" if lull_start <= current_time < lull_end else "ENGINE_A"
 
-    def check_buy_signal(self, current_rsi: float, current_atr: float) -> bool:
+    def check_buy_signal(self, current_rsi: float, current_atr: float, current_price: float) -> bool:
         """Adaptive RSI entry with volatility filter for ENGINE_B."""
         active_engine = self.get_active_engine()
 
@@ -109,10 +109,11 @@ class AlphaHardTargetScalper:
             rsi_threshold = 32.0
         else:  # ENGINE_B
             rsi_threshold = 45.0
-            # During lull, only enter if volatility has contracted
-            baseline_atr = 0.015  # 1.5% of typical price
-            if current_atr > baseline_atr * 0.8:
-                # Volatility still too high, skip entry
+            # During lull, only enter if volatility has DROPPED relative to morning
+            baseline_atr = 0.01  # RELAXED from 0.015 to 1.0% (was 1.5%)
+            atr_pct = current_atr / current_price
+            if atr_pct > baseline_atr:
+                # Volatility still elevated, skip entry
                 return False
 
         return current_rsi <= rsi_threshold
@@ -312,10 +313,13 @@ class AlphaHardTargetScalper:
         emergency_liquidation_zone = now.hour == 15 and now.minute >= 57
 
         if emergency_liquidation_zone and len(positions) > 0:
-            send_slack_alert("🚨 *Power Hour E-Stop: Liquidating all positions before close.*")
+            print(f"🚨 [E-STOP TRIGGERED] {len(positions)} open positions detected at {now.strftime('%H:%M:%S')}")
+            send_slack_alert(f"🚨 *Power Hour E-Stop: Liquidating {len(positions)} position(s) before close.*")
             for pos in positions:
+                print(f"   Liquidating {pos.symbol}: {int(pos.qty)} shares @ ${pos.current_price}")
                 if pos.symbol not in self.in_flight_sales:
                     if self.execute_order(pos.symbol, int(pos.qty), OrderSide.SELL):
+                        print(f"   ✅ Order accepted for {pos.symbol}")
                         self.in_flight_sales.add(pos.symbol)
                         try:
                             latest_price = float(pos.current_price)
@@ -323,6 +327,8 @@ class AlphaHardTargetScalper:
                             latest_price = float(pos.avg_entry_price)
                         trade_id = self._get_open_trade_id(pos.symbol)
                         self._log_trade_exit(pos.symbol, int(pos.qty), latest_price, trade_id)
+                    else:
+                        print(f"   ❌ Order REJECTED for {pos.symbol}")
             return
 
         try:
@@ -358,14 +364,13 @@ class AlphaHardTargetScalper:
 
                     atr = self.calculate_atr(ticker_df)
 
-                    # ENGINE_B hard close: liquidate all positions by 13:00 (1:00 PM)
-                    if active_engine == "ENGINE_B" and now.hour == 13 and now.minute < 5:
-                        if is_holding:
-                            if self.execute_order(ticker, qty, OrderSide.SELL):
-                                trade_id = self._get_open_trade_id(ticker)
-                                self._log_trade_exit(ticker, qty, current_price, trade_id)
-                                send_slack_alert(f"🏁 *ENGINE_B Hard Close ({ticker})*: Lull ended, position liquidated.")
-                            continue
+                    # Hard lull close: liquidate ALL positions (ENGINE_A or ENGINE_B) at 13:00
+                    if now.hour == 13 and now.minute < 5 and is_holding:
+                        if self.execute_order(ticker, qty, OrderSide.SELL):
+                            trade_id = self._get_open_trade_id(ticker)
+                            self._log_trade_exit(ticker, qty, current_price, trade_id)
+                            send_slack_alert(f"🏁 *Lull Close ({ticker})*: Position liquidated at 13:00.")
+                        continue
 
                     if active_engine == "ENGINE_A":
                         target_tp_partial = avg_entry + (atr * 1.5)
@@ -421,7 +426,7 @@ class AlphaHardTargetScalper:
                     rsi = self.calculate_rsi(ticker_df)
                     current_atr = self.calculate_atr(ticker_df)
                     
-                    if self.check_buy_signal(rsi, current_atr):
+                    if self.check_buy_signal(rsi, current_atr, current_price):
                         # Dynamic Sizing
                         buy_power = float(self.client.get_account().buying_power)
                         config = TICKER_CONFIGS.get(ticker, {"max_share_allocation": 0.05})
