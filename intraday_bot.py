@@ -104,9 +104,9 @@ class AlphaHardTargetScalper:
     def check_buy_signal(self, current_rsi: float, current_volatility: float) -> bool:
         """Adaptive RSI: Allows higher entries during high volatility (Momentum mode)."""
         # Base threshold
-        rsi_threshold = 40.0
+        rsi_threshold = 45.0
         if self.get_active_engine() == "ENGINE_B":
-            rsi_threshold -= 3.0
+            rsi_threshold = 42.0
             
         # If volatility is high (momentum is strong), allow entry up to 55 RSI
         if current_volatility > self.volatility_base * 2:
@@ -137,13 +137,24 @@ class AlphaHardTargetScalper:
         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
         df.to_csv(TRADE_FILE, index=False)
 
-    def _log_trade_exit(self, ticker, qty, price):
+    def _get_open_trade_id(self, ticker):
+        """Looks up the Trade_ID of the current OPEN position for a ticker."""
+        df = pd.read_csv(TRADE_FILE, dtype={"Trade_ID": str})
+        open_mask = (df['Ticker'] == ticker) & (df['Status'] == 'OPEN')
+        if not open_mask.any():
+            return None
+        return str(df.loc[df[open_mask].index[0], 'Trade_ID'])
+
+    def _log_trade_exit(self, ticker, qty, price, trade_id=None):
         """Appends a new EXIT row, updates stats, and sends context-aware Slack alerts."""
         df = pd.read_csv(TRADE_FILE)
-        
+
         # 1. Locate the corresponding OPEN trade
-        open_mask = (df['Ticker'] == ticker) & (df['Status'] == 'OPEN')
-        
+        if trade_id is not None:
+            open_mask = (df['Ticker'] == ticker) & (df['Trade_ID'] == trade_id) & (df['Status'] == 'OPEN')
+        else:
+            open_mask = (df['Ticker'] == ticker) & (df['Status'] == 'OPEN')
+
         if not open_mask.any():
             print(f"⚠️ Warning: Attempted to log exit for {ticker} but no OPEN position found.")
             return
@@ -320,22 +331,33 @@ class AlphaHardTargetScalper:
                     if current_price >= target_tp_partial and qty >= 10:
                         sell_qty = qty // 2
                         if self.execute_order(ticker, sell_qty, OrderSide.SELL):
-                            self._log_trade_exit(ticker, sell_qty, current_price)
+                            trade_id = self._get_open_trade_id(ticker)
+                            self._log_trade_exit(ticker, sell_qty, current_price, trade_id)
                             send_slack_alert(f"💰 *Partial Exit ({ticker})*: Locked in gains. Sleeping for 30s.")
                             time.sleep(30) # Cool down after partial exit
                         continue
 
                     # Final Exit
-                    trailing_level = calculate_trailing_stop(current_price, avg_entry)
+                    trailing_level = calculate_trailing_stop(current_price, avg_entry, atr)
                     if current_price >= (avg_entry + (atr * 3.0)) or should_exit_trade(current_price, trailing_level):
                         if self.execute_order(ticker, qty, OrderSide.SELL):
                             self.in_flight_sales.add(ticker)
-                            self._log_trade_exit(ticker, qty, current_price)
+                            trade_id = self._get_open_trade_id(ticker)
+                            self._log_trade_exit(ticker, qty, current_price, trade_id)
                             time.sleep(30) # Cool down after full exit
                         continue
 
                 # --- PASS 2: ADAPTIVE ENTRY ---
                 elif not is_holding and not market_close_imminent:
+                    # Guard against stale position feed lag
+                    open_trades_df = pd.read_csv(TRADE_FILE)
+                    already_open = not open_trades_df[
+                        (open_trades_df['Ticker'] == ticker) &
+                        (open_trades_df['Status'] == 'OPEN')
+                    ].empty
+                    if already_open:
+                        continue
+
                     # COOLDOWN: Wait 10 minutes if we just traded this ticker
                     if ticker in self.last_trade_results:
                         if (datetime.now() - self.last_trade_results[ticker]['time']) < timedelta(minutes=10):
@@ -350,7 +372,7 @@ class AlphaHardTargetScalper:
                         allocation = TICKER_CONFIGS.get(ticker, {"max_share_allocation": 0.05})["max_share_allocation"]
                         qty = int((buy_power * allocation) // current_price)
                         
-                        if qty > 0:
+                        if qty > 0 and (qty * current_price) <= buy_power:
                             if self.execute_order(ticker, qty, OrderSide.BUY):
                                 self._log_trade_entry(f"tr_{int(time.time())}", ticker, qty, current_price, active_engine, rsi)
                                 send_slack_alert(f"🚀 *Opened {ticker} ({qty} shares)*. Sleeping for 60s.")

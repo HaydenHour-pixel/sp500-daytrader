@@ -26,15 +26,15 @@ def get_high_volatility_tickers(ticker_list, window=5):
     return sorted_tickers[:5]
 
 # --- 2. TRAILING STOP LOGIC ---
-def calculate_trailing_stop(current_price, entry_price, trailing_percent=0.005):
+def calculate_trailing_stop(current_price, entry_price, atr, atr_multiplier=1.5):
     """
-    Returns the dynamic trailing stop level.
-    If price moves up 1%, the stop moves up by 0.5% of current price.
+    Returns a dynamic trailing stop level based on ATR.
+    Stop trails at current_price - (atr * atr_multiplier).
+    If not yet in profit, falls back to entry_price - (atr * 1.0) as a hard floor.
     """
-    # Simple trailing logic: stop stays at entry until profit, then moves up
     if current_price > entry_price:
-        return current_price * (1 - trailing_percent)
-    return entry_price * 0.99  # Static 1% stop if not in profit yet
+        return current_price - (atr * atr_multiplier)
+    return entry_price - (atr * 1.0)
 
 def should_exit_trade(current_price, trailing_stop_level):
     if current_price <= trailing_stop_level:
