@@ -104,9 +104,9 @@ class AlphaHardTargetScalper:
     def check_buy_signal(self, current_rsi: float, current_volatility: float) -> bool:
         """Adaptive RSI: Allows higher entries during high volatility (Momentum mode)."""
         # Base threshold
-        rsi_threshold = 45.0
+        rsi_threshold = 32.0
         if self.get_active_engine() == "ENGINE_B":
-            rsi_threshold = 42.0
+            rsi_threshold = 29.0
             
         # If volatility is high (momentum is strong), allow entry up to 55 RSI
         if current_volatility > self.volatility_base * 2:
@@ -146,8 +146,8 @@ class AlphaHardTargetScalper:
         return str(df.loc[df[open_mask].index[0], 'Trade_ID'])
 
     def _log_trade_exit(self, ticker, qty, price, trade_id=None):
-        """Appends a new EXIT row, updates stats, and sends context-aware Slack alerts."""
-        df = pd.read_csv(TRADE_FILE)
+        """Appends a new CLOSED exit-leg row, updates stats, and sends context-aware Slack alerts."""
+        df = pd.read_csv(TRADE_FILE, dtype={"Trade_ID": str, "Status": str, "Entry_Time": str})
 
         # 1. Locate the corresponding OPEN trade
         if trade_id is not None:
@@ -165,12 +165,13 @@ class AlphaHardTargetScalper:
         initial_qty = int(df.loc[idx, 'Qty'])
         
         # Calculate how much was already sold to determine if this is the final exit
-        previous_exits = df[(df['Trade_ID'] == trade_id) & (df['Status'] == 'EXIT')]['Qty'].sum()
+        # Exit-leg rows are identified by a blank Entry_Time (Status is always "CLOSED" now)
+        previous_exits = df[(df['Trade_ID'] == trade_id) & (df['Entry_Time'].isna())]['Qty'].sum()
         remaining_qty = initial_qty - previous_exits
-        
+
         # 2. Calculate PnL for this specific leg
         leg_pnl = round((round(float(price), 2) - entry_price) * int(qty), 2)
-        
+
         # 3. Create a NEW row for this Exit
         exit_row = {
             "Trade_ID": trade_id,
@@ -182,7 +183,7 @@ class AlphaHardTargetScalper:
             "Exit_Time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             "Exit_Price": round(float(price), 2),
             "PnL": float(leg_pnl),
-            "Status": "EXIT",
+            "Status": "CLOSED",
             "Engine": df.loc[idx, 'Engine']
         }
         
@@ -197,7 +198,7 @@ class AlphaHardTargetScalper:
         is_final_exit = (remaining_qty - qty) <= 0
         
         # Calculate total trade PnL for the final alert
-        all_exits_pnl = df[(df['Trade_ID'] == trade_id) & (df['Status'] == 'EXIT')]['PnL'].sum()
+        all_exits_pnl = df[(df['Trade_ID'] == trade_id) & (df['Entry_Time'].isna())]['PnL'].sum()
         
         # 6. Update status to CLOSED if final exit, then trigger summary refresh
         if is_final_exit:
@@ -231,8 +232,8 @@ class AlphaHardTargetScalper:
             (df['Status'] == 'CLOSED')
         ]['Trade_ID'].unique()
 
-        # Step 2: sum PnL from EXIT rows only (entry rows carry 0.0)
-        exit_rows = df[(df['Trade_ID'].isin(today_closed_ids)) & (df['Status'] == 'EXIT')]
+        # Step 2: sum PnL from exit-leg rows only (identified by a blank Entry_Time; entry rows carry 0.0)
+        exit_rows = df[(df['Trade_ID'].isin(today_closed_ids)) & (df['Entry_Time'].isna())]
         trade_summary = exit_rows.groupby('Trade_ID')['PnL'].sum()
 
         total_pnl = round(trade_summary.sum(), 2)
@@ -349,14 +350,17 @@ class AlphaHardTargetScalper:
 
                 # --- PASS 2: ADAPTIVE ENTRY ---
                 elif not is_holding and not market_close_imminent:
-                    # Guard against stale position feed lag
-                    open_trades_df = pd.read_csv(TRADE_FILE)
-                    already_open = not open_trades_df[
-                        (open_trades_df['Ticker'] == ticker) &
-                        (open_trades_df['Status'] == 'OPEN')
-                    ].empty
-                    if already_open:
-                        continue
+                    # Guard: use local trade log as authoritative source to prevent ghost re-entries
+                    try:
+                        open_trades_df = pd.read_csv(TRADE_FILE, dtype={"Status": str})
+                        already_open = not open_trades_df[
+                            (open_trades_df['Ticker'] == ticker) &
+                            (open_trades_df['Status'] == 'OPEN')
+                        ].empty
+                        if already_open:
+                            continue
+                    except Exception:
+                        pass  # If log unreadable, allow the trade to proceed
 
                     # COOLDOWN: Wait 10 minutes if we just traded this ticker
                     if ticker in self.last_trade_results:
