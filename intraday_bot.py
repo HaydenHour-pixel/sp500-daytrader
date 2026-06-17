@@ -206,12 +206,17 @@ class AlphaHardTargetScalper:
             df.to_csv(TRADE_FILE, index=False)
             
             outcome_emoji = "🟢 *WIN*" if all_exits_pnl > 0 else "🔴 *LOSS*"
-            
-            message = (f"🏁 *Final Position Closed ({ticker})*\n"
+
+            if all_exits_pnl > 0:
+                self.daily_wins += 1
+            else:
+                self.daily_losses += 1
+
+            message = (f"⚖️ *Position Closed ({ticker})*\n"
                        f"• Result: {outcome_emoji}\n"
-                       f"• Exit Qty: {qty}\n"
-                       f"• This Leg PnL: *${leg_pnl:+.2f}*\n"
-                       f"• *Total Trade PnL: ${all_exits_pnl:+.2f}*")
+                       f"• Trade PnL: *${all_exits_pnl:+.2f}*\n"
+                       f"• Executed Price: ${price:.2f} (Avg Entry: ${entry_price:.2f})\n"
+                       f"• Current Session Record: {self.daily_wins}W-{self.daily_losses}L")
         else:
             message = (f"💰 *Partial Exit Executed ({ticker})*\n"
                        f"• Exit Qty: {qty}\n"
@@ -280,7 +285,8 @@ class AlphaHardTargetScalper:
 
     def execute_scalp_pipeline(self):
         now = datetime.now()
-        
+        print(f"⏱️ Target Scan Initiated: {now.strftime('%H:%M:%S')}")
+
         # 1. Market Hours Gatekeeper
         is_market_open = (now.hour == 9 and now.minute >= 30) or (10 <= now.hour < 16)
         if not is_market_open:
@@ -379,7 +385,14 @@ class AlphaHardTargetScalper:
                         if qty > 0 and (qty * current_price) <= buy_power:
                             if self.execute_order(ticker, qty, OrderSide.BUY):
                                 self._log_trade_entry(f"tr_{int(time.time())}", ticker, qty, current_price, active_engine, rsi)
-                                send_slack_alert(f"🚀 *Opened {ticker} ({qty} shares)*. Sleeping for 60s.")
+                                send_slack_alert(
+                                    f"🚀 *Position Opened ({ticker})*\n"
+                                    f"• Action: *BUY (Trend-Aware)*\n"
+                                    f"• Shares: {qty}\n"
+                                    f"• Price: ${current_price:.2f}\n"
+                                    f"• RSI at Entry: {rsi:.1f}\n"
+                                    f"• Engine: {active_engine}"
+                                )
                                 time.sleep(60) # Cool down after entry to let trend develop
 
             except Exception as e:
