@@ -25,14 +25,14 @@ if not API_KEY or not SECRET_KEY:
 
 # UNIFIED ASSET PROFILES (Standardized Baseline to prevent strategy overfitting)
 TICKER_CONFIGS = {
-    "TSLA": {"max_share_allocation": 0.12},  
-    "NVDA": {"max_share_allocation": 0.12},  
-    "AMD":  {"max_share_allocation": 0.10},  
-    "NFLX": {"max_share_allocation": 0.10},  
-    "META": {"max_share_allocation": 0.10},  
-    "MSFT": {"max_share_allocation": 0.10},  
-    "AMZN": {"max_share_allocation": 0.10},  
-    "AAPL": {"max_share_allocation": 0.10}   
+    "TSLA": {"max_share_allocation": 0.12, "engine_b_allocation": 0.06},
+    "NVDA": {"max_share_allocation": 0.12, "engine_b_allocation": 0.06},
+    "AMD":  {"max_share_allocation": 0.10, "engine_b_allocation": 0.05},
+    "NFLX": {"max_share_allocation": 0.10, "engine_b_allocation": 0.05},
+    "META": {"max_share_allocation": 0.10, "engine_b_allocation": 0.05},
+    "MSFT": {"max_share_allocation": 0.10, "engine_b_allocation": 0.05},
+    "AMZN": {"max_share_allocation": 0.10, "engine_b_allocation": 0.05},
+    "AAPL": {"max_share_allocation": 0.10, "engine_b_allocation": 0.05}
 }
 
 TICKER_SQUAD = list(TICKER_CONFIGS.keys())
@@ -101,17 +101,20 @@ class AlphaHardTargetScalper:
         lull_end = datetime_time(13, 30)
         return "ENGINE_B" if lull_start <= current_time < lull_end else "ENGINE_A"
 
-    def check_buy_signal(self, current_rsi: float, current_volatility: float) -> bool:
-        """Adaptive RSI: Allows higher entries during high volatility (Momentum mode)."""
-        # Base threshold
-        rsi_threshold = 32.0
-        if self.get_active_engine() == "ENGINE_B":
-            rsi_threshold = 29.0
-            
-        # If volatility is high (momentum is strong), allow entry up to 55 RSI
-        if current_volatility > self.volatility_base * 2:
-            rsi_threshold = 55.0
-            
+    def check_buy_signal(self, current_rsi: float, current_atr: float) -> bool:
+        """Adaptive RSI entry with volatility filter for ENGINE_B."""
+        active_engine = self.get_active_engine()
+
+        if active_engine == "ENGINE_A":
+            rsi_threshold = 32.0
+        else:  # ENGINE_B
+            rsi_threshold = 45.0
+            # During lull, only enter if volatility has contracted
+            baseline_atr = 0.015  # 1.5% of typical price
+            if current_atr > baseline_atr * 0.8:
+                # Volatility still too high, skip entry
+                return False
+
         return current_rsi <= rsi_threshold
 
     def _log_trade_entry(self, trade_id, ticker, qty, price, engine_used, rsi_at_entry):
@@ -199,7 +202,14 @@ class AlphaHardTargetScalper:
         
         # Calculate total trade PnL for the final alert
         all_exits_pnl = df[(df['Trade_ID'] == trade_id) & (df['Entry_Time'].isna())]['PnL'].sum()
-        
+
+        # Track result for cooldown decision
+        self.last_trade_results[ticker] = {
+            "time": datetime.now(),
+            "pnl": float(all_exits_pnl),
+            "is_loss": all_exits_pnl <= 0
+        }
+
         # 6. Update status to CLOSED if final exit, then trigger summary refresh
         if is_final_exit:
             df.at[idx, 'Status'] = "CLOSED"
@@ -347,26 +357,43 @@ class AlphaHardTargetScalper:
                         continue
 
                     atr = self.calculate_atr(ticker_df)
-                    target_tp_partial = avg_entry + (atr * 1.5) # Increased to 1.5 ATR for fewer triggers
-                    
-                    # Partial Exit (50%)
+
+                    # ENGINE_B hard close: liquidate all positions by 13:00 (1:00 PM)
+                    if active_engine == "ENGINE_B" and now.hour == 13 and now.minute < 5:
+                        if is_holding:
+                            if self.execute_order(ticker, qty, OrderSide.SELL):
+                                trade_id = self._get_open_trade_id(ticker)
+                                self._log_trade_exit(ticker, qty, current_price, trade_id)
+                                send_slack_alert(f"🏁 *ENGINE_B Hard Close ({ticker})*: Lull ended, position liquidated.")
+                            continue
+
+                    if active_engine == "ENGINE_A":
+                        target_tp_partial = avg_entry + (atr * 1.5)
+                        target_tp_final = avg_entry + (atr * 3.0)
+                        trailing_multiplier = 1.5
+                    else:  # ENGINE_B
+                        target_tp_partial = avg_entry + (atr * 0.5)
+                        target_tp_final = avg_entry + (atr * 1.0)
+                        trailing_multiplier = 0.3
+
+                    # Partial exit check
                     if current_price >= target_tp_partial and qty >= 10:
                         sell_qty = qty // 2
                         if self.execute_order(ticker, sell_qty, OrderSide.SELL):
                             trade_id = self._get_open_trade_id(ticker)
                             self._log_trade_exit(ticker, sell_qty, current_price, trade_id)
                             send_slack_alert(f"💰 *Partial Exit ({ticker})*: Locked in gains. Sleeping for 30s.")
-                            time.sleep(30) # Cool down after partial exit
+                            time.sleep(30)
                         continue
 
-                    # Final Exit
-                    trailing_level = calculate_trailing_stop(current_price, avg_entry, atr)
-                    if current_price >= (avg_entry + (atr * 3.0)) or should_exit_trade(current_price, trailing_level):
+                    # Final exit check
+                    trailing_level = calculate_trailing_stop(current_price, avg_entry, atr, trailing_multiplier)
+                    if current_price >= target_tp_final or should_exit_trade(current_price, trailing_level):
                         if self.execute_order(ticker, qty, OrderSide.SELL):
                             self.in_flight_sales.add(ticker)
                             trade_id = self._get_open_trade_id(ticker)
                             self._log_trade_exit(ticker, qty, current_price, trade_id)
-                            time.sleep(30) # Cool down after full exit
+                            time.sleep(30)
                         continue
 
                 # --- PASS 2: ADAPTIVE ENTRY ---
@@ -383,9 +410,12 @@ class AlphaHardTargetScalper:
                     except Exception:
                         pass  # If log unreadable, allow the trade to proceed
 
-                    # COOLDOWN: Wait 10 minutes if we just traded this ticker
+                    # COOLDOWN: Wait longer after a loss than after a win
                     if ticker in self.last_trade_results:
-                        if (datetime.now() - self.last_trade_results[ticker]['time']) < timedelta(minutes=10):
+                        is_loss = self.last_trade_results[ticker].get('is_loss', False)
+                        cooldown_minutes = 30 if is_loss else 10
+                        elapsed = (datetime.now() - self.last_trade_results[ticker]['time']).total_seconds() / 60
+                        if elapsed < cooldown_minutes:
                             continue
 
                     rsi = self.calculate_rsi(ticker_df)
@@ -394,7 +424,11 @@ class AlphaHardTargetScalper:
                     if self.check_buy_signal(rsi, current_atr):
                         # Dynamic Sizing
                         buy_power = float(self.client.get_account().buying_power)
-                        allocation = TICKER_CONFIGS.get(ticker, {"max_share_allocation": 0.05})["max_share_allocation"]
+                        config = TICKER_CONFIGS.get(ticker, {"max_share_allocation": 0.05})
+                        if active_engine == "ENGINE_B":
+                            allocation = config.get("engine_b_allocation", 0.05)
+                        else:
+                            allocation = config["max_share_allocation"]
                         qty = int((buy_power * allocation) // current_price)
                         
                         if qty > 0 and (qty * current_price) <= buy_power:
