@@ -287,15 +287,6 @@ class AlphaHardTargetScalper:
         now = datetime.now()
         print(f"⏱️ Target Scan Initiated: {now.strftime('%H:%M:%S')}")
 
-        # 1. Market Hours Gatekeeper
-        is_market_open = (now.hour == 9 and now.minute >= 30) or (10 <= now.hour < 16)
-        if not is_market_open:
-            if now.hour < 16:
-                time.sleep(60)
-                return
-            else:
-                sys.exit(0)
-
         active_engine = self.get_active_engine()
         market_close_imminent = now.hour == 15 and now.minute >= 45
 
@@ -304,6 +295,23 @@ class AlphaHardTargetScalper:
             positions = self.client.get_all_positions()
             portfolio = {pos.symbol: int(pos.qty) for pos in positions}
         except Exception as e:
+            return
+
+        # Emergency Liquidation Zone: force-close everything before market close
+        emergency_liquidation_zone = now.hour == 15 and now.minute >= 57
+
+        if emergency_liquidation_zone and len(positions) > 0:
+            send_slack_alert("🚨 *Power Hour E-Stop: Liquidating all positions before close.*")
+            for pos in positions:
+                if pos.symbol not in self.in_flight_sales:
+                    if self.execute_order(pos.symbol, int(pos.qty), OrderSide.SELL):
+                        self.in_flight_sales.add(pos.symbol)
+                        try:
+                            latest_price = float(pos.current_price)
+                        except Exception:
+                            latest_price = float(pos.avg_entry_price)
+                        trade_id = self._get_open_trade_id(pos.symbol)
+                        self._log_trade_exit(pos.symbol, int(pos.qty), latest_price, trade_id)
             return
 
         try:
@@ -418,16 +426,20 @@ if __name__ == "__main__":
 
     while True:
         now = datetime.now().time()
-        
+
         # Check if we are inside market hours
         if market_open <= now <= market_close:
             try:
                 bot.execute_scalp_pipeline()
             except Exception as e:
                 print(f"⚠️ Loop interruption: {e}. Resuming in 60s...")
-            
+
             # Throttle the loop to prevent excessive API hits
-            time.sleep(60) 
+            time.sleep(60)
         else:
-            # Outside hours, wait 5 minutes before checking if market is open
-            time.sleep(300)
+            if now > market_close:
+                print("🛑 Market closed. Shutting down.")
+                send_slack_alert("🛑 *Market closed. Bot shutting down cleanly.*")
+                break
+            else:
+                time.sleep(300)  # Pre-market, wait 5 min
