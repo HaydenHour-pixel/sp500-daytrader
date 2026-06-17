@@ -74,7 +74,7 @@ class AlphaHardTargetScalper:
             pd.DataFrame(columns=headers).to_csv(SUMMARY_FILE, index=False)
             
         if not os.path.exists(TRADE_FILE):
-            headers = ["Trade_ID", "Ticker", "Type", "Qty", "Entry_Time", "Entry_Price", "Exit_Time", "Exit_Price", "PnL", "Status", "Engine"]
+            headers = ["Trade_ID", "Ticker", "Type", "Qty", "Entry_Time", "Entry_Price", "Exit_Time", "Exit_Price", "PnL", "Status", "Engine", "RSI_At_Entry"]
             pd.DataFrame(columns=headers).to_csv(TRADE_FILE, index=False)
 
     def _hydrate_state_from_csv(self):
@@ -211,24 +211,28 @@ class AlphaHardTargetScalper:
     def _update_daily_summary(self):
         """Refreshes summary metrics by reading the source-of-truth trade log."""
         if not os.path.exists(TRADE_FILE): return
-        
-        df = pd.read_csv(TRADE_FILE)
-        # Filter for today's data
-        today_trades = df[df['Entry_Time'].str.contains(self.today_str, na=False)]
-        
-        # Group by Trade_ID to treat multi-leg trades as single units
-        trade_summary = today_trades.groupby('Trade_ID')['PnL'].sum()
-        
-        # Re-calculate accurate totals
+
+        df = pd.read_csv(TRADE_FILE, dtype={"Trade_ID": str, "Status": str, "Entry_Time": str})
+
+        # Step 1: find Trade_IDs entered today that are fully CLOSED
+        today_closed_ids = df[
+            df['Entry_Time'].str.contains(self.today_str, na=False) &
+            (df['Status'] == 'CLOSED')
+        ]['Trade_ID'].unique()
+
+        # Step 2: sum PnL from EXIT rows only (entry rows carry 0.0)
+        exit_rows = df[(df['Trade_ID'].isin(today_closed_ids)) & (df['Status'] == 'EXIT')]
+        trade_summary = exit_rows.groupby('Trade_ID')['PnL'].sum()
+
         total_pnl = round(trade_summary.sum(), 2)
         wins = int((trade_summary > 0).sum())
         losses = int((trade_summary <= 0).sum())
-        
+
         # Update summary file
         summary_df = pd.read_csv(SUMMARY_FILE)
         summary_row = {
             "Date": self.today_str,
-            **{f"{t}_PnL": round(today_trades[today_trades['Ticker'] == t]['PnL'].sum(), 2) for t in TICKER_SQUAD},
+            **{f"{t}_PnL": round(exit_rows[exit_rows['Ticker'] == t]['PnL'].sum(), 2) for t in TICKER_SQUAD},
             "Total_PnL": total_pnl,
             "Wins": wins,
             "Losses": losses
