@@ -295,6 +295,7 @@ class AlphaHardTargetScalper:
             positions = self.client.get_all_positions()
             portfolio = {pos.symbol: int(pos.qty) for pos in positions}
         except Exception as e:
+            print(f"⚠️ Position fetch failed: {e}")
             return
 
         # Emergency Liquidation Zone: force-close everything before market close
@@ -317,12 +318,18 @@ class AlphaHardTargetScalper:
         try:
             shared_data = yf.download(TICKER_SQUAD, period="2d", interval="1m", group_by='ticker', progress=False, timeout=5)
         except Exception as e:
+            print(f"⚠️ yfinance download failed: {e}")
             return
+
+        loaded = [t for t in TICKER_SQUAD if t in shared_data and not shared_data[t].dropna().empty]
+        print(f"   📊 Data loaded for {len(loaded)}/{len(TICKER_SQUAD)} tickers")
 
         for ticker in TICKER_SQUAD:
             try:
                 ticker_df = shared_data[ticker].dropna()
-                if ticker_df.empty: continue
+                if ticker_df.empty:
+                    print(f"   ⏭️ {ticker}: no data this cycle")
+                    continue
                 
                 current_price = ticker_df['Close'].iloc[-1]
                 is_holding = ticker in portfolio
@@ -435,7 +442,7 @@ if __name__ == "__main__":
                 print(f"⚠️ Loop interruption: {e}. Resuming in 60s...")
 
             # Throttle the loop to prevent excessive API hits
-            time.sleep(60)
+            time.sleep(30)
         else:
             if now > market_close:
                 print("🛑 Market closed. Shutting down.")
