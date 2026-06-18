@@ -166,12 +166,6 @@ class AlphaHardTargetScalper:
         idx = df[open_mask].index[0]
         trade_id = str(df.loc[idx, 'Trade_ID'])
         entry_price = float(df.loc[idx, 'Entry_Price'])
-        initial_qty = int(df.loc[idx, 'Qty'])
-        
-        # Calculate how much was already sold to determine if this is the final exit
-        # Exit-leg rows are identified by a blank Entry_Time (Status is always "CLOSED" now)
-        previous_exits = df[(df['Trade_ID'] == trade_id) & (df['Entry_Time'].isna())]['Qty'].sum()
-        remaining_qty = initial_qty - previous_exits
 
         # 2. Calculate PnL for this specific leg
         leg_pnl = round((round(float(price), 2) - entry_price) * int(qty), 2)
@@ -199,7 +193,7 @@ class AlphaHardTargetScalper:
         self.ticker_pnl[ticker] += leg_pnl
         
         # 5. Determine if this is the final closing exit
-        is_final_exit = (remaining_qty - qty) <= 0
+        is_final_exit = True
         
         # Calculate total trade PnL for the final alert
         all_exits_pnl = df[(df['Trade_ID'] == trade_id) & (df['Entry_Time'].isna())]['PnL'].sum()
@@ -228,11 +222,7 @@ class AlphaHardTargetScalper:
                        f"• Trade PnL: *${all_exits_pnl:+.2f}*\n"
                        f"• Executed Price: ${price:.2f} (Avg Entry: ${entry_price:.2f})\n"
                        f"• Current Session Record: {self.daily_wins}W-{self.daily_losses}L")
-        else:
-            message = (f"💰 *Partial Exit Executed ({ticker})*\n"
-                       f"• Exit Qty: {qty}\n"
-                       f"• This Leg PnL: *${leg_pnl:+.2f}*")
-        
+
         send_slack_alert(message)
         self._update_daily_summary()
 
@@ -373,26 +363,15 @@ class AlphaHardTargetScalper:
                         continue
 
                     if active_engine == "ENGINE_A":
-                        target_tp_partial = avg_entry + (atr * 1.5)
                         target_tp_final = avg_entry + (atr * 3.0)
                         trailing_multiplier = 1.5
                     else:  # ENGINE_B
-                        target_tp_partial = avg_entry + (atr * 0.5)
                         target_tp_final = avg_entry + (atr * 1.0)
                         trailing_multiplier = 0.3
 
-                    # Partial exit check
-                    if current_price >= target_tp_partial and qty >= 10:
-                        sell_qty = qty // 2
-                        if self.execute_order(ticker, sell_qty, OrderSide.SELL):
-                            trade_id = self._get_open_trade_id(ticker)
-                            self._log_trade_exit(ticker, sell_qty, current_price, trade_id)
-                            send_slack_alert(f"💰 *Partial Exit ({ticker})*: Locked in gains. Sleeping for 30s.")
-                            time.sleep(30)
-                        continue
-
-                    # Final exit check
+                    # Single exit: trailing stop OR take-profit target reached
                     trailing_level = calculate_trailing_stop(current_price, avg_entry, atr, trailing_multiplier)
+
                     if current_price >= target_tp_final or should_exit_trade(current_price, trailing_level):
                         if self.execute_order(ticker, qty, OrderSide.SELL):
                             self.in_flight_sales.add(ticker)
