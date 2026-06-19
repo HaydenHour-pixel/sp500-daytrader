@@ -195,8 +195,8 @@ class AlphaHardTargetScalper:
         # 5. Determine if this is the final closing exit
         is_final_exit = True
         
-        # Calculate total trade PnL for the final alert
-        all_exits_pnl = df[(df['Trade_ID'] == trade_id) & (df['Entry_Time'].isna())]['PnL'].sum()
+        # Calculate total trade PnL for the final alert (single exit leg now, so it equals leg_pnl)
+        all_exits_pnl = leg_pnl
 
         # Track result for cooldown decision
         self.last_trade_results[ticker] = {
@@ -341,44 +341,50 @@ class AlphaHardTargetScalper:
                 is_holding = ticker in portfolio
 
                 # --- PASS 1: EXIT LOGIC ---
-                if is_holding and ticker not in self.in_flight_sales:
-                    alpaca_position = next(pos for pos in positions if pos.symbol == ticker)
-                    avg_entry = float(alpaca_position.avg_entry_price)
-                    qty = int(alpaca_position.qty)
-                    
-                    # GUARD: Close entire position if qty is too small to split (prevents "dust" trades)
-                    if qty < 5:
-                        if self.execute_order(ticker, qty, OrderSide.SELL):
-                            self._log_trade_exit(ticker, qty, current_price)
+                if is_holding:
+                    # Hard lull close fires regardless of in_flight_sales state
+                    if now.hour == 13 and now.minute < 5:
+                        if ticker not in self.in_flight_sales:
+                            alpaca_position = next(pos for pos in positions if pos.symbol == ticker)
+                            qty = int(alpaca_position.qty)
+                            current_price_val = float(alpaca_position.current_price)
+                            if self.execute_order(ticker, qty, OrderSide.SELL):
+                                trade_id = self._get_open_trade_id(ticker)
+                                self._log_trade_exit(ticker, qty, current_price_val, trade_id)
+                                send_slack_alert(f"🏁 *Lull Close ({ticker})*: Position liquidated at 13:00.")
+                                self.in_flight_sales.add(ticker)
                         continue
 
-                    atr = self.calculate_atr(ticker_df)
+                    if ticker not in self.in_flight_sales:
+                        alpaca_position = next(pos for pos in positions if pos.symbol == ticker)
+                        avg_entry = float(alpaca_position.avg_entry_price)
+                        qty = int(alpaca_position.qty)
 
-                    # Hard lull close: liquidate ALL positions (ENGINE_A or ENGINE_B) at 13:00
-                    if now.hour == 13 and now.minute < 5 and is_holding:
-                        if self.execute_order(ticker, qty, OrderSide.SELL):
-                            trade_id = self._get_open_trade_id(ticker)
-                            self._log_trade_exit(ticker, qty, current_price, trade_id)
-                            send_slack_alert(f"🏁 *Lull Close ({ticker})*: Position liquidated at 13:00.")
-                        continue
+                        # GUARD: Close entire position if qty is too small to split (prevents "dust" trades)
+                        if qty < 5:
+                            if self.execute_order(ticker, qty, OrderSide.SELL):
+                                self._log_trade_exit(ticker, qty, current_price)
+                            continue
 
-                    if active_engine == "ENGINE_A":
-                        target_tp_final = avg_entry + (atr * 3.0)
-                        trailing_multiplier = 1.5
-                    else:  # ENGINE_B
-                        target_tp_final = avg_entry + (atr * 1.0)
-                        trailing_multiplier = 0.3
+                        atr = self.calculate_atr(ticker_df)
 
-                    # Single exit: trailing stop OR take-profit target reached
-                    trailing_level = calculate_trailing_stop(current_price, avg_entry, atr, trailing_multiplier)
+                        if active_engine == "ENGINE_A":
+                            target_tp_final = avg_entry + (atr * 3.0)
+                            trailing_multiplier = 1.5
+                        else:  # ENGINE_B
+                            target_tp_final = avg_entry + (atr * 1.0)
+                            trailing_multiplier = 0.3
 
-                    if current_price >= target_tp_final or should_exit_trade(current_price, trailing_level):
-                        if self.execute_order(ticker, qty, OrderSide.SELL):
-                            self.in_flight_sales.add(ticker)
-                            trade_id = self._get_open_trade_id(ticker)
-                            self._log_trade_exit(ticker, qty, current_price, trade_id)
-                            time.sleep(30)
-                        continue
+                        # Single exit: trailing stop OR take-profit target reached
+                        trailing_level = calculate_trailing_stop(current_price, avg_entry, atr, trailing_multiplier)
+
+                        if current_price >= target_tp_final or should_exit_trade(current_price, trailing_level):
+                            if self.execute_order(ticker, qty, OrderSide.SELL):
+                                self.in_flight_sales.add(ticker)
+                                trade_id = self._get_open_trade_id(ticker)
+                                self._log_trade_exit(ticker, qty, current_price, trade_id)
+                                time.sleep(30)
+                            continue
 
                 # --- PASS 2: ADAPTIVE ENTRY ---
                 elif not is_holding and not market_close_imminent:
@@ -431,14 +437,16 @@ class AlphaHardTargetScalper:
             except Exception as e:
                 print(f"❌ Execution error on {ticker}: {e}")
 
-    def execute_order(self, ticker, qty, side):
+    def execute_order(self, ticker, qty, side, tif=None):
         try:
-            order = MarketOrderRequest(symbol=ticker, qty=qty, side=side, time_in_force=TimeInForce.DAY)
+            if tif is None:
+                tif = TimeInForce.IOC if datetime.now().hour >= 15 and datetime.now().minute >= 55 else TimeInForce.DAY
+            order = MarketOrderRequest(symbol=ticker, qty=qty, side=side, time_in_force=tif)
             self.client.submit_order(order)
             print(f"   ✅ DISPATCHED: {side.value.upper()} {qty} shares of {ticker}")
             return True
         except Exception as e:
-            print(f"   ⚠️ Order rejected: {e}")
+            print(f"   ❌ Order REJECTED ({ticker}): {e}")
             return False
 
 if __name__ == "__main__":
