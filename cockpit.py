@@ -1,9 +1,15 @@
 import os
+import json
 import pandas as pd
 import yfinance as yf
 import streamlit as st
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from datetime import datetime, timedelta, time as datetime_time
+from alpaca.trading.client import TradingClient
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Set up page configurations
 st.set_page_config(page_title="Alpha Volatility Cockpit", layout="wide", page_icon="📊")
@@ -13,6 +19,112 @@ st.markdown("Use this visual utility to audit and review the entry and exit exec
 
 TRADE_FILE = "trade_log.csv"
 SUMMARY_FILE = "daily_summary.csv"
+STATUS_FILE = "bot_status.json"
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+
+
+@st.cache_resource
+def get_alpaca_client():
+    return TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
+
+# =====================================================================
+# BOT STATUS HEARTBEAT BANNER
+# =====================================================================
+if os.path.exists(STATUS_FILE):
+    try:
+        with open(STATUS_FILE, "r") as f:
+            bot_status = json.load(f)
+
+        last_scan = datetime.fromisoformat(bot_status["last_scan"])
+        seconds_since_scan = (datetime.now() - last_scan).total_seconds()
+        is_live = seconds_since_scan < 90
+
+        status_col1, status_col2, status_col3, status_col4, status_col5 = st.columns(5)
+        with status_col1:
+            st.markdown("🟢 **Bot Live**" if is_live else "🔴 **Bot Offline / Stale**")
+        with status_col2:
+            st.markdown(f"**Engine:** {bot_status.get('active_engine', 'N/A')}")
+        with status_col3:
+            st.markdown(f"**Session:** {bot_status.get('daily_wins', 0)}W-{bot_status.get('daily_losses', 0)}L")
+        with status_col4:
+            st.markdown(f"**Open Positions:** {bot_status.get('open_position_count', 0)}")
+        with status_col5:
+            st.markdown(f"**Last Scan:** {last_scan.strftime('%H:%M:%S')}")
+    except Exception as e:
+        st.warning(f"⚠️ Could not parse bot status heartbeat: {e}")
+else:
+    st.markdown("⚪ No heartbeat yet — bot hasn't run")
+
+# =====================================================================
+# LIVE SESSION MONITOR (reads directly from Alpaca, not trade_log.csv)
+# =====================================================================
+def _render_live_positions():
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        st.error("🔑 Missing Alpaca credentials. Add ALPACA_API_KEY and ALPACA_SECRET_KEY to your .env file to use the Live Session Monitor.")
+        return
+
+    client = get_alpaca_client()
+
+    try:
+        positions = client.get_all_positions()
+    except Exception as e:
+        st.error(f"⚠️ Could not fetch positions from Alpaca: {e}")
+        return
+
+    if not positions:
+        st.info("✅ No open positions right now.")
+        return
+
+    rows = []
+    total_unrealized_pl = 0.0
+    for pos in positions:
+        unrealized_pl = float(pos.unrealized_pl)
+        total_unrealized_pl += unrealized_pl
+        rows.append({
+            "Symbol": pos.symbol,
+            "Qty": int(pos.qty),
+            "Avg Entry Price": float(pos.avg_entry_price),
+            "Current Price": float(pos.current_price),
+            "Unrealized PnL": unrealized_pl,
+            "Unrealized PnL %": float(pos.unrealized_plpc) * 100,
+            "Market Value": float(pos.market_value)
+        })
+    positions_df = pd.DataFrame(rows)
+
+    metric_col1, metric_col2 = st.columns(2)
+    with metric_col1:
+        st.metric("Total Unrealized PnL", f"${total_unrealized_pl:,.2f}")
+    with metric_col2:
+        st.metric("Open Positions", len(positions))
+
+    styled = positions_df.style.map(
+        lambda v: f"color: {'#10B981' if v >= 0 else '#EF4444'}",
+        subset=["Unrealized PnL"]
+    ).format({
+        "Avg Entry Price": "${:,.2f}",
+        "Current Price": "${:,.2f}",
+        "Unrealized PnL": "${:,.2f}",
+        "Unrealized PnL %": "{:+.2f}%",
+        "Market Value": "${:,.2f}"
+    })
+
+    st.dataframe(styled, hide_index=True, use_container_width=True)
+
+
+if hasattr(st, "fragment"):
+    @st.fragment(run_every="30s")
+    def render_live_session_monitor():
+        st.caption(f"Auto-refreshing every 30s · Last refresh: {datetime.now().strftime('%H:%M:%S')}")
+        _render_live_positions()
+else:
+    def render_live_session_monitor():
+        refresh_container = st.empty()
+        if st.button("🔄 Refresh"):
+            pass  # button press alone triggers a rerun of this script
+        with refresh_container.container():
+            st.caption(f"Last refresh: {datetime.now().strftime('%H:%M:%S')} (manual refresh — st.fragment unavailable)")
+            _render_live_positions()
 
 # =====================================================================
 # INITIALIZE PERSISTENT STATE VARS (Unlinked to Widget Keys to Prevent Streamlit Deletion)
@@ -35,8 +147,19 @@ if "stored_all_chart_style" not in st.session_state:
 if "stored_leaderboard_expanded" not in st.session_state:
     st.session_state.stored_leaderboard_expanded = True
 
+# Mode Selection including our Macro Equity Curve View and Live Session Monitor
+# Defined up-front so "Live Session Monitor" is reachable even when trade_log.csv is empty/missing
+view_mode = st.sidebar.radio(
+    "Select Analysis Perspective:",
+    ["Single Trade Audit", "All-in-One Asset View", "Macro Equity Curve", "Live Session Monitor"]
+)
+
+if view_mode == "Live Session Monitor":
+    st.subheader("📡 Live Session Monitor")
+    st.markdown("Real-time positions pulled directly from your Alpaca paper account.")
+    render_live_session_monitor()
 # Check if trade log exists
-if not os.path.exists(TRADE_FILE) or os.stat(TRADE_FILE).st_size == 0:
+elif not os.path.exists(TRADE_FILE) or os.stat(TRADE_FILE).st_size == 0:
     st.info("ℹ️ No trade data found yet. Your cockpit will automatically populate once `trade_log.csv` records its first closed positions on Monday!")
 else:
     # Read the local trade history ledger
@@ -91,13 +214,7 @@ else:
         
         st.sidebar.metric("Total Session PnL", f"${total_pnl:,.2f}", delta=f"{total_pnl:+.2f}")
         st.sidebar.metric("Win Rate", f"{win_rate:.1f}%", delta=f"{wins}W - {losses}L")
-        
-        # Mode Selection including our Macro Equity Curve View
-        view_mode = st.sidebar.radio(
-            "Select Analysis Perspective:",
-            ["Single Trade Audit", "All-in-One Asset View", "Macro Equity Curve"]
-        )
-        
+
         if view_mode == "Single Trade Audit":
             st.subheader("🔍 Audit Individual Executions")
             st.markdown("Inspect trade execution timelines matched against live minute candles.")
@@ -478,14 +595,19 @@ else:
             
             # Compute a continuous cumulative sum of PnL from closed trades
             df_closed['Cumulative_PnL'] = df_closed['PnL'].cumsum()
-            
-            # Construct Equity Curve Line Plot
-            fig = go.Figure()
-            
+            df_closed['Running_Peak'] = df_closed['Cumulative_PnL'].cummax()
+            df_closed['Drawdown'] = df_closed['Cumulative_PnL'] - df_closed['Running_Peak']
+
+            # Construct Equity Curve Line Plot with an underwater drawdown panel beneath it
+            fig = make_subplots(
+                rows=2, cols=1, shared_xaxes=True,
+                row_heights=[0.7, 0.3], vertical_spacing=0.08
+            )
+
             # Fill under the line color dynamically (Green if overall winning, Red if overall losing)
             fill_color = "rgba(16, 185, 129, 0.15)" if total_pnl >= 0 else "rgba(239, 68, 68, 0.15)"
             line_color = "#10B981" if total_pnl >= 0 else "#EF4444"
-            
+
             fig.add_trace(go.Scatter(
                 x=df_closed['Exit_Time'],
                 y=df_closed['Cumulative_PnL'],
@@ -495,27 +617,41 @@ else:
                 fill='tozeroy',
                 fillcolor=fill_color,
                 hovertemplate="<b>Time:</b> %{x}<br><b>Net Profit:</b> $%{y:,.2f}<extra></extra>"
-            ))
-            
+            ), row=1, col=1)
+
             # Reference benchmark line at $0.00 profit
             fig.add_shape(
                 type="line", x0=df_closed['Exit_Time'].min(), x1=df_closed['Exit_Time'].max(),
-                y0=0, y1=0, line=dict(color="rgba(255,255,255,0.3)", width=1, dash="dot")
+                y0=0, y1=0, line=dict(color="rgba(255,255,255,0.3)", width=1, dash="dot"),
+                row=1, col=1
             )
-            
+
+            # Underwater drawdown area
+            fig.add_trace(go.Scatter(
+                x=df_closed['Exit_Time'],
+                y=df_closed['Drawdown'],
+                mode='lines',
+                name='Drawdown',
+                line=dict(color="#EF4444", width=2),
+                fill='tozeroy',
+                fillcolor="rgba(239, 68, 68, 0.2)",
+                hovertemplate="<b>Time:</b> %{x}<br><b>Drawdown:</b> $%{y:,.2f}<extra></extra>"
+            ), row=2, col=1)
+
             fig.update_layout(
                 title="Account Capital Growth Curve (Net Cumulative Return)",
-                yaxis_title="Total Profits / Losses ($)",
-                xaxis_title="Execution Timeline",
                 template="plotly_dark",
                 height=600
             )
-            
+            fig.update_xaxes(title_text="Execution Timeline", row=2, col=1)
+            fig.update_yaxes(title_text="Total Profits / Losses ($)", row=1, col=1)
+            fig.update_yaxes(title_text="Drawdown ($)", row=2, col=1)
+
             st.plotly_chart(fig, use_container_width=True)
-            
+
             # Additional Analytical Insight Box
             st.markdown("### 📊 Portfolio Metrics Dashboard")
-            m_col1, m_col2, m_col3 = st.columns(3)
+            m_col1, m_col2, m_col3, m_col4 = st.columns(4)
             with m_col1:
                 largest_win = df_closed['PnL'].max()
                 st.metric("Best Single Trade", f"${largest_win:,.2f}")
@@ -525,3 +661,38 @@ else:
             with m_col3:
                 avg_trade = df_closed['PnL'].mean()
                 st.metric("Expectancy (Avg/Trade)", f"${avg_trade:+.2f}")
+            with m_col4:
+                max_drawdown = df_closed['Drawdown'].min()
+                st.metric("Max Drawdown", f"${max_drawdown:,.2f}")
+
+            # Engine Comparison Breakdown
+            st.markdown("### ⚙️ Engine Comparison")
+            df_closed['Engine'] = df_closed['Engine'].fillna("Legacy")
+
+            def _profit_factor(pnl_series):
+                gross_win = pnl_series[pnl_series > 0].sum()
+                gross_loss = pnl_series[pnl_series < 0].sum()
+                return gross_win / abs(gross_loss) if gross_loss != 0 else float('inf')
+
+            engine_stats = df_closed.groupby('Engine').apply(lambda g: pd.Series({
+                'Trade Count': len(g),
+                'Total PnL': g['PnL'].sum(),
+                'Win Rate': (g['PnL'] > 0).mean() * 100,
+                'Avg PnL/Trade': g['PnL'].mean(),
+                'Profit Factor': _profit_factor(g['PnL'])
+            }), include_groups=False).reset_index()
+
+            st.dataframe(
+                engine_stats,
+                column_config={
+                    "Engine": st.column_config.TextColumn("Engine"),
+                    "Trade Count": st.column_config.NumberColumn("Trade Count", format="%d"),
+                    "Total PnL": st.column_config.NumberColumn("Total PnL", format="$%.2f"),
+                    "Win Rate": st.column_config.NumberColumn("Win Rate", format="%.1f%%"),
+                    "Avg PnL/Trade": st.column_config.NumberColumn("Avg PnL/Trade", format="$%.2f"),
+                    "Profit Factor": st.column_config.NumberColumn("Profit Factor", format="%.2f"),
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+            st.caption("This tells you whether ENGINE_A and ENGINE_B are both pulling their weight, or if one is carrying (or dragging) the account.")

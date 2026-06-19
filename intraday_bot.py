@@ -1,6 +1,7 @@
 import os
 import time
 import sys
+import json
 import requests
 from datetime import datetime, time as datetime_time, timedelta
 import pandas as pd
@@ -38,6 +39,7 @@ TICKER_CONFIGS = {
 TICKER_SQUAD = list(TICKER_CONFIGS.keys())
 SUMMARY_FILE = "daily_summary.csv"
 TRADE_FILE = "trade_log.csv"
+STATUS_FILE = "bot_status.json"
 
 def send_slack_alert(message: str):
     """Dispatches a structured message payload directly to your Slack workspace."""
@@ -440,6 +442,18 @@ class AlphaHardTargetScalper:
 
             except Exception as e:
                 print(f"❌ Execution error on {ticker}: {e}")
+
+        try:
+            with open(STATUS_FILE, "w") as f:
+                json.dump({
+                    "last_scan": datetime.now().isoformat(),
+                    "active_engine": active_engine,
+                    "daily_wins": self.daily_wins,
+                    "daily_losses": self.daily_losses,
+                    "open_position_count": len(positions)
+                }, f)
+        except Exception as e:
+            print(f"⚠️ Status heartbeat write failed: {e}")
 
     def execute_order(self, ticker, qty, side, tif=None):
         try:
