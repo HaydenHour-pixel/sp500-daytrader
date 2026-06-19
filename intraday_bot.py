@@ -340,6 +340,10 @@ class AlphaHardTargetScalper:
                 current_price = ticker_df['Close'].iloc[-1]
                 is_holding = ticker in portfolio
 
+                # Clear stale in-flight flag once the position has confirmed-left the portfolio
+                if not is_holding and ticker in self.in_flight_sales:
+                    self.in_flight_sales.discard(ticker)
+
                 # --- PASS 1: EXIT LOGIC ---
                 if is_holding:
                     # Hard lull close fires regardless of in_flight_sales state
