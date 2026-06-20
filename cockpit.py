@@ -6,6 +6,7 @@ import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta, time as datetime_time
+from zoneinfo import ZoneInfo
 from alpaca.trading.client import TradingClient
 from dotenv import load_dotenv
 
@@ -37,7 +38,8 @@ if os.path.exists(STATUS_FILE):
             bot_status = json.load(f)
 
         last_scan = datetime.fromisoformat(bot_status["last_scan"])
-        seconds_since_scan = (datetime.now() - last_scan).total_seconds()
+        now_ref = datetime.now(ZoneInfo("America/New_York")) if last_scan.tzinfo else datetime.now()
+        seconds_since_scan = (now_ref - last_scan).total_seconds()
         is_live = seconds_since_scan < 90
 
         status_col1, status_col2, status_col3, status_col4, status_col5 = st.columns(5)
@@ -189,7 +191,7 @@ else:
         'Status': get_final_status, # Use the helper function here
         'Entry_Time': 'first',
         'Exit_Time': 'max',
-        'Qty': 'sum',
+        'Qty': 'first',
         'Entry_Price': 'mean',
         'Exit_Price': 'mean',
         'Engine': 'first'
@@ -270,6 +272,11 @@ else:
 
             selected_trade = trade_legs.iloc[0]
 
+            # The entry leg (Entry_Time not null) carries the RSI reading the bot used to decide the trade
+            entry_leg = trade_legs[trade_legs['Entry_Time'].notna()]
+            rsi_at_entry_raw = entry_leg.iloc[0].get('RSI_At_Entry') if not entry_leg.empty else None
+            rsi_at_entry_label = f"{float(rsi_at_entry_raw):.1f}" if pd.notna(rsi_at_entry_raw) else "N/A"
+
             # Use the first/last of the raw legs for setting chart boundaries
             entry_dt = trade_legs['Entry_Time'].min()
             exit_dt = trade_legs['Exit_Time'].max()
@@ -338,7 +345,7 @@ else:
                             x=[entry_row['Entry_Time']], y=[entry_row['Entry_Price']],
                             mode="markers+text",
                             marker=dict(symbol="triangle-up", color="#10B981", size=14, line=dict(color="white", width=2)),
-                            name="Buy Entry", text=[f"Buy {entry_row['Qty']}"],
+                            name="Buy Entry", text=[f"Buy {entry_row['Qty']} | RSI {rsi_at_entry_label}"],
                             textposition="bottom center", showlegend=False
                         ))
 
@@ -359,7 +366,7 @@ else:
                 )
                 st.plotly_chart(fig, use_container_width=True)
                 
-                col1, col2, col3, col4 = st.columns(4)
+                col1, col2, col3, col4, col5 = st.columns(5)
                 with col1: st.metric("Shares Traded", f"{selected_trade['Qty']} shares")
                 with col2:
                     holding_time = exit_dt - entry_dt
@@ -368,6 +375,7 @@ else:
                     engine_val = selected_trade['Engine'] if 'Engine' in selected_trade and pd.notna(selected_trade['Engine']) else "Legacy (N/A)"
                     st.metric("Trade Engine", str(engine_val))
                 with col4: st.metric("Net Gain/Loss", f"${selected_trade['PnL']:+.2f}")
+                with col5: st.metric("RSI at Entry", rsi_at_entry_label)
 
         elif view_mode == "All-in-One Asset View":
             st.subheader("📈 All-in-One Asset View")

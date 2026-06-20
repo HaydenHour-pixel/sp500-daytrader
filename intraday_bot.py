@@ -2,8 +2,10 @@ import os
 import time
 import sys
 import json
+import tempfile
 import requests
 from datetime import datetime, time as datetime_time, timedelta
+from zoneinfo import ZoneInfo
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -41,6 +43,16 @@ SUMMARY_FILE = "daily_summary.csv"
 TRADE_FILE = "trade_log.csv"
 STATUS_FILE = "bot_status.json"
 
+def now_et():
+    return datetime.now(ZoneInfo("America/New_York"))
+
+def atomic_write_csv(df, path):
+    d = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
+    os.close(fd)
+    df.to_csv(tmp, index=False)
+    os.replace(tmp, path)  # atomic on the same filesystem
+
 def send_slack_alert(message: str):
     """Dispatches a structured message payload directly to your Slack workspace."""
     if not SLACK_URL:
@@ -56,7 +68,7 @@ class AlphaHardTargetScalper:
     def __init__(self):
         self.client = TradingClient(API_KEY, SECRET_KEY, paper=True)
         self.in_flight_sales = set()  
-        self.today_str = datetime.now().strftime('%Y-%m-%d')
+        self.today_str = now_et().strftime('%Y-%m-%d')
         self.ticker_pnl = {ticker: 0.0 for ticker in TICKER_SQUAD}
         self.daily_wins = 0
         self.daily_losses = 0
@@ -98,7 +110,7 @@ class AlphaHardTargetScalper:
 
     def get_active_engine(self) -> str:
         """Determines active time windows to adapt entry behaviors."""
-        current_time = datetime.now().time()
+        current_time = now_et().time()
         lull_start = datetime_time(11, 30)
         lull_end = datetime_time(13, 30)
         return "ENGINE_B" if lull_start <= current_time < lull_end else "ENGINE_A"
@@ -130,7 +142,7 @@ class AlphaHardTargetScalper:
             "Ticker": ticker, 
             "Type": "LONG", 
             "Qty": int(qty),
-            "Entry_Time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 
+            "Entry_Time": now_et().strftime('%Y-%m-%d %H:%M:%S'),
             "Entry_Price": round(float(price), 2),
             "RSI_At_Entry": round(float(rsi_at_entry), 2), # New AI Context
             "Engine": engine_used,                         # New AI Context
@@ -141,7 +153,7 @@ class AlphaHardTargetScalper:
         }
         
         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-        df.to_csv(TRADE_FILE, index=False)
+        atomic_write_csv(df, TRADE_FILE)
 
     def _get_open_trade_id(self, ticker):
         """Looks up the Trade_ID of the current OPEN position for a ticker."""
@@ -180,7 +192,7 @@ class AlphaHardTargetScalper:
             "Qty": int(qty),
             "Entry_Time": "",
             "Entry_Price": "",
-            "Exit_Time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "Exit_Time": now_et().strftime('%Y-%m-%d %H:%M:%S'),
             "Exit_Price": round(float(price), 2),
             "PnL": float(leg_pnl),
             "Status": "CLOSED",
@@ -188,10 +200,10 @@ class AlphaHardTargetScalper:
         }
         
         df = pd.concat([df, pd.DataFrame([exit_row])], ignore_index=True)
-        df.to_csv(TRADE_FILE, index=False)
+        atomic_write_csv(df, TRADE_FILE)
         
         # 4. Update bot memory
-        self.last_trade_results[ticker] = {"time": datetime.now(), "pnl": float(leg_pnl)}
+        self.last_trade_results[ticker] = {"time": now_et(), "pnl": float(leg_pnl)}
         self.ticker_pnl[ticker] += leg_pnl
         
         # 5. Determine if this is the final closing exit
@@ -202,7 +214,7 @@ class AlphaHardTargetScalper:
 
         # Track result for cooldown decision
         self.last_trade_results[ticker] = {
-            "time": datetime.now(),
+            "time": now_et(),
             "pnl": float(all_exits_pnl),
             "is_loss": all_exits_pnl <= 0
         }
@@ -210,7 +222,7 @@ class AlphaHardTargetScalper:
         # 6. Update status to CLOSED if final exit, then trigger summary refresh
         if is_final_exit:
             df.at[idx, 'Status'] = "CLOSED"
-            df.to_csv(TRADE_FILE, index=False)
+            atomic_write_csv(df, TRADE_FILE)
             
             outcome_emoji = "🟢 *WIN*" if all_exits_pnl > 0 else "🔴 *LOSS*"
 
@@ -265,7 +277,7 @@ class AlphaHardTargetScalper:
         else:
             summary_df = pd.concat([summary_df, pd.DataFrame([summary_row])], ignore_index=True)
             
-        summary_df.to_csv(SUMMARY_FILE, index=False)
+        atomic_write_csv(summary_df, SUMMARY_FILE)
         print(f"📊 Summary Sheet Synced | Total PnL: ${total_pnl:.2f} | {wins}W-{losses}L")
 
     def calculate_rsi(self, df):
@@ -287,7 +299,7 @@ class AlphaHardTargetScalper:
         return tr.rolling(window=14).mean().iloc[-1]
 
     def execute_scalp_pipeline(self):
-        now = datetime.now()
+        now = now_et()
         print(f"⏱️ Target Scan Initiated: {now.strftime('%H:%M:%S')}")
 
         active_engine = self.get_active_engine()
@@ -410,7 +422,7 @@ class AlphaHardTargetScalper:
                     if ticker in self.last_trade_results:
                         is_loss = self.last_trade_results[ticker].get('is_loss', False)
                         cooldown_minutes = 30 if is_loss else 10
-                        elapsed = (datetime.now() - self.last_trade_results[ticker]['time']).total_seconds() / 60
+                        elapsed = (now_et() - self.last_trade_results[ticker]['time']).total_seconds() / 60
                         if elapsed < cooldown_minutes:
                             continue
 
@@ -446,7 +458,7 @@ class AlphaHardTargetScalper:
         try:
             with open(STATUS_FILE, "w") as f:
                 json.dump({
-                    "last_scan": datetime.now().isoformat(),
+                    "last_scan": now_et().isoformat(),
                     "active_engine": active_engine,
                     "daily_wins": self.daily_wins,
                     "daily_losses": self.daily_losses,
@@ -458,7 +470,7 @@ class AlphaHardTargetScalper:
     def execute_order(self, ticker, qty, side, tif=None):
         try:
             if tif is None:
-                tif = TimeInForce.IOC if datetime.now().hour >= 15 and datetime.now().minute >= 55 else TimeInForce.DAY
+                tif = TimeInForce.IOC if now_et().hour >= 15 and now_et().minute >= 55 else TimeInForce.DAY
             order = MarketOrderRequest(symbol=ticker, qty=qty, side=side, time_in_force=tif)
             self.client.submit_order(order)
             print(f"   ✅ DISPATCHED: {side.value.upper()} {qty} shares of {ticker}")
@@ -476,7 +488,7 @@ if __name__ == "__main__":
     market_close = datetime_time(16, 0)
 
     while True:
-        now = datetime.now().time()
+        now = now_et().time()
 
         # Check if we are inside market hours
         if market_open <= now <= market_close:
