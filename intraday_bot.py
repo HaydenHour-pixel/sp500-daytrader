@@ -281,7 +281,7 @@ class AlphaHardTargetScalper:
         print(f"📊 Summary Sheet Synced | Total PnL: ${total_pnl:.2f} | {wins}W-{losses}L")
 
     def calculate_rsi(self, df):
-        if len(df) < 20: return 50
+        if len(df) < 30: return 50.0  # need a stable 14-period window before trusting RSI
         change = df['Close'].diff()
         gain = change.mask(change < 0, 0)
         loss = -change.mask(change > 0, 0)
@@ -361,7 +361,7 @@ class AlphaHardTargetScalper:
                 # --- PASS 1: EXIT LOGIC ---
                 if is_holding:
                     # Hard lull close fires regardless of in_flight_sales state
-                    if now.hour == 13 and now.minute < 5:
+                    if now.hour == 13 and 30 <= now.minute < 35:
                         if ticker not in self.in_flight_sales:
                             alpaca_position = next(pos for pos in positions if pos.symbol == ticker)
                             qty = int(alpaca_position.qty)
@@ -369,7 +369,7 @@ class AlphaHardTargetScalper:
                             if self.execute_order(ticker, qty, OrderSide.SELL):
                                 trade_id = self._get_open_trade_id(ticker)
                                 self._log_trade_exit(ticker, qty, current_price_val, trade_id)
-                                send_slack_alert(f"🏁 *Lull Close ({ticker})*: Position liquidated at 13:00.")
+                                send_slack_alert(f"🏁 *Lull Close ({ticker})*: Position liquidated at 13:30 (lull end).")
                                 self.in_flight_sales.add(ticker)
                         continue
 
@@ -428,7 +428,12 @@ class AlphaHardTargetScalper:
 
                     rsi = self.calculate_rsi(ticker_df)
                     current_atr = self.calculate_atr(ticker_df)
-                    
+
+                    # Reject entries on unstable/garbage RSI (data artifact, not a real signal)
+                    if rsi < 5 or rsi > 95:
+                        print(f"   ⏭️ {ticker}: RSI {rsi:.1f} out of trustworthy range, skipping")
+                        continue
+
                     if self.check_buy_signal(rsi, current_atr, current_price):
                         # Dynamic Sizing
                         buy_power = float(self.client.get_account().buying_power)
