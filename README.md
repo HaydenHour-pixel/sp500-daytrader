@@ -18,7 +18,7 @@ The bot runs a dual-engine scan loop across 8 tickers every 30 seconds during ma
 
 **ENGINE_B** (11:30–13:30) — adapts to midday chop. Enters on RSI ≤ 45 with a volatility contraction filter (ATR/price < 1.0%), uses tighter 6% allocation and 0.3×/1.0× ATR exits to scalp sideways drift. (Currently looking to improve or get rid of)
 
-**Asset universe:** TSLA, NVDA, AMD, NFLX, META, MSFT, AMZN, AAPL
+**Asset universe:** TSLA, NVDA, AMD, NFLX, META, MSFT, AMZN, AAPL (Looking to expand upon)
 
 ---
 
