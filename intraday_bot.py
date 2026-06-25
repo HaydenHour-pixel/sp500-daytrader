@@ -80,6 +80,7 @@ class AlphaHardTargetScalper:
         
         # Announce bot initialization on startup
         send_slack_alert(f"🟢 *System Initialized & Recovered*\n• Today's Baseline Record: {self.daily_wins}W-{self.daily_losses}L\n• Active Tracking Assets: {', '.join(TICKER_SQUAD)}")
+        self._reconcile_with_alpaca()
 
     def _initialize_csv_files(self):
         """Creates output tracking sheets locally if missing."""
@@ -107,6 +108,52 @@ class AlphaHardTargetScalper:
         self.daily_wins = int((closed_today['PnL'] > 0).sum())
         self.daily_losses = int((closed_today['PnL'] <= 0).sum())
         print(f"🔄 State Recovery: Hydrated {len(closed_today)} past entries. Session: {self.daily_wins}W-{self.daily_losses}L")
+
+    def _reconcile_with_alpaca(self):
+        """Compares Alpaca's real account equity against the trade-log cumulative
+        PnL at startup, surfacing any drift between the two sources of truth."""
+        try:
+            account = self.client.get_account()
+            equity = float(account.equity)
+            last_equity = float(account.last_equity)
+            alpaca_daily_change = equity - last_equity
+        except Exception as e:
+            print(f"⚠️ Reconciliation: could not fetch Alpaca account: {e}")
+            return
+
+        # Trade-log cumulative across ALL closed trades on record
+        log_cumulative = 0.0
+        if os.path.exists(TRADE_FILE):
+            try:
+                df = pd.read_csv(TRADE_FILE, dtype={"Entry_Time": str})
+                exit_rows = df[df['Entry_Time'].isna() | (df['Entry_Time'] == "")]
+                log_cumulative = float(exit_rows['PnL'].sum())
+            except Exception as e:
+                print(f"⚠️ Reconciliation: could not read trade log: {e}")
+
+        starting_capital = 100000.0
+        alpaca_total_pnl = equity - starting_capital
+        drift = alpaca_total_pnl - log_cumulative
+
+        print("=" * 55)
+        print("🔍 STARTUP RECONCILIATION (Alpaca vs Trade Log)")
+        print(f"   Alpaca equity:          ${equity:,.2f}")
+        print(f"   Alpaca total PnL:       ${alpaca_total_pnl:+,.2f}  (vs $100k base)")
+        print(f"   Trade-log cumulative:   ${log_cumulative:+,.2f}")
+        print(f"   DRIFT (Alpaca - log):   ${drift:+,.2f}")
+        if abs(drift) > 25:
+            print(f"   ⚠️  Drift exceeds $25 — sources disagree, investigate.")
+        else:
+            print(f"   ✅ Sources agree within tolerance.")
+        print("=" * 55)
+
+        send_slack_alert(
+            f"🔍 *Startup Reconciliation*\n"
+            f"• Alpaca equity: ${equity:,.2f}\n"
+            f"• Alpaca total PnL: ${alpaca_total_pnl:+,.2f}\n"
+            f"• Trade-log cumulative: ${log_cumulative:+,.2f}\n"
+            f"• Drift: ${drift:+,.2f}"
+        )
 
     def get_active_engine(self) -> str:
         """Determines active time windows to adapt entry behaviors."""
