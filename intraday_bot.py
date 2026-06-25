@@ -122,13 +122,9 @@ class AlphaHardTargetScalper:
         if active_engine == "ENGINE_A":
             rsi_threshold = 32.0
         else:  # ENGINE_B
-            rsi_threshold = 45.0
-            # During lull, only enter if volatility has DROPPED relative to morning
-            baseline_atr = 0.01  # RELAXED from 0.015 to 1.0% (was 1.5%)
-            atr_pct = current_atr / current_price
-            if atr_pct > baseline_atr:
-                # Volatility still elevated, skip entry
-                return False
+            # ENGINE_B disabled: lull-window entries showed PF 0.60 / payoff 0.93
+            # over 3 days. No new entries during the lull; exits still managed normally.
+            return False
 
         return current_rsi <= rsi_threshold
 
@@ -322,15 +318,17 @@ class AlphaHardTargetScalper:
             for pos in positions:
                 print(f"   Liquidating {pos.symbol}: {int(pos.qty)} shares @ ${pos.current_price}")
                 if pos.symbol not in self.in_flight_sales:
-                    if self.execute_order(pos.symbol, int(pos.qty), OrderSide.SELL):
+                    try:
+                        fallback_price = float(pos.current_price)
+                    except Exception:
+                        fallback_price = float(pos.avg_entry_price)
+                    order = self.execute_order(pos.symbol, int(pos.qty), OrderSide.SELL)
+                    if order is not None:
                         print(f"   ✅ Order accepted for {pos.symbol}")
                         self.in_flight_sales.add(pos.symbol)
-                        try:
-                            latest_price = float(pos.current_price)
-                        except Exception:
-                            latest_price = float(pos.avg_entry_price)
+                        fill_price = self._get_fill_price(order.id, fallback_price)
                         trade_id = self._get_open_trade_id(pos.symbol)
-                        self._log_trade_exit(pos.symbol, int(pos.qty), latest_price, trade_id)
+                        self._log_trade_exit(pos.symbol, int(pos.qty), fill_price, trade_id)
                     else:
                         print(f"   ❌ Order REJECTED for {pos.symbol}")
             return
@@ -366,9 +364,11 @@ class AlphaHardTargetScalper:
                             alpaca_position = next(pos for pos in positions if pos.symbol == ticker)
                             qty = int(alpaca_position.qty)
                             current_price_val = float(alpaca_position.current_price)
-                            if self.execute_order(ticker, qty, OrderSide.SELL):
+                            order = self.execute_order(ticker, qty, OrderSide.SELL)
+                            if order is not None:
+                                fill_price = self._get_fill_price(order.id, current_price_val)
                                 trade_id = self._get_open_trade_id(ticker)
-                                self._log_trade_exit(ticker, qty, current_price_val, trade_id)
+                                self._log_trade_exit(ticker, qty, fill_price, trade_id)
                                 send_slack_alert(f"🏁 *Lull Close ({ticker})*: Position liquidated at 13:30 (lull end).")
                                 self.in_flight_sales.add(ticker)
                         continue
@@ -380,8 +380,10 @@ class AlphaHardTargetScalper:
 
                         # GUARD: Close entire position if qty is too small to split (prevents "dust" trades)
                         if qty < 5:
-                            if self.execute_order(ticker, qty, OrderSide.SELL):
-                                self._log_trade_exit(ticker, qty, current_price)
+                            order = self.execute_order(ticker, qty, OrderSide.SELL)
+                            if order is not None:
+                                fill_price = self._get_fill_price(order.id, current_price)
+                                self._log_trade_exit(ticker, qty, fill_price)
                             continue
 
                         atr = self.calculate_atr(ticker_df)
@@ -397,10 +399,12 @@ class AlphaHardTargetScalper:
                         trailing_level = calculate_trailing_stop(current_price, avg_entry, atr, trailing_multiplier)
 
                         if current_price >= target_tp_final or should_exit_trade(current_price, trailing_level):
-                            if self.execute_order(ticker, qty, OrderSide.SELL):
+                            order = self.execute_order(ticker, qty, OrderSide.SELL)
+                            if order is not None:
                                 self.in_flight_sales.add(ticker)
+                                fill_price = self._get_fill_price(order.id, current_price)
                                 trade_id = self._get_open_trade_id(ticker)
-                                self._log_trade_exit(ticker, qty, current_price, trade_id)
+                                self._log_trade_exit(ticker, qty, fill_price, trade_id)
                                 time.sleep(30)
                             continue
 
@@ -445,13 +449,15 @@ class AlphaHardTargetScalper:
                         qty = int((buy_power * allocation) // current_price)
                         
                         if qty > 0 and (qty * current_price) <= buy_power:
-                            if self.execute_order(ticker, qty, OrderSide.BUY):
-                                self._log_trade_entry(f"tr_{int(time.time())}", ticker, qty, current_price, active_engine, rsi)
+                            order = self.execute_order(ticker, qty, OrderSide.BUY)
+                            if order is not None:
+                                fill_price = self._get_fill_price(order.id, current_price)
+                                self._log_trade_entry(f"tr_{int(time.time())}", ticker, qty, fill_price, active_engine, rsi)
                                 send_slack_alert(
                                     f"🚀 *Position Opened ({ticker})*\n"
                                     f"• Action: *BUY (Trend-Aware)*\n"
                                     f"• Shares: {qty}\n"
-                                    f"• Price: ${current_price:.2f}\n"
+                                    f"• Price: ${fill_price:.2f}\n"
                                     f"• RSI at Entry: {rsi:.1f}\n"
                                     f"• Engine: {active_engine}"
                                 )
@@ -477,12 +483,25 @@ class AlphaHardTargetScalper:
             if tif is None:
                 tif = TimeInForce.IOC if now_et().hour >= 15 and now_et().minute >= 55 else TimeInForce.DAY
             order = MarketOrderRequest(symbol=ticker, qty=qty, side=side, time_in_force=tif)
-            self.client.submit_order(order)
+            submitted = self.client.submit_order(order)
             print(f"   ✅ DISPATCHED: {side.value.upper()} {qty} shares of {ticker}")
-            return True
+            return submitted
         except Exception as e:
             print(f"   ❌ Order REJECTED ({ticker}): {e}")
-            return False
+            return None
+
+    def _get_fill_price(self, order_id, fallback_price):
+        """Polls Alpaca for the real average fill price of a submitted order."""
+        for _ in range(5):
+            try:
+                o = self.client.get_order_by_id(order_id)
+                if o.filled_avg_price is not None:
+                    return float(o.filled_avg_price)
+            except Exception as e:
+                print(f"   ⚠️ Fill price poll error: {e}")
+            time.sleep(1)
+        print(f"   ⚠️ Fill price unavailable, using fallback ${fallback_price:.2f}")
+        return float(fallback_price)
 
 if __name__ == "__main__":
     bot = AlphaHardTargetScalper()
