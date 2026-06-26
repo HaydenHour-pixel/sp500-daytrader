@@ -96,18 +96,27 @@ class AlphaHardTargetScalper:
         """Loads today's history from trade sheets to maintain state consistency across restarts."""
         if not os.path.exists(TRADE_FILE): return
         df = pd.read_csv(TRADE_FILE, dtype={"Entry_Time": str, "Exit_Time": str, "Status": str, "Trade_ID": str, "Engine": str})
+        df['Entry_Time'] = df['Entry_Time'].replace('', pd.NA)
         if df.empty: return
-        
-        today_trades = df[df['Entry_Time'].str.contains(self.today_str)]
-        closed_today = today_trades[today_trades['Status'] == 'CLOSED']
-        
+
+        # Trade_IDs entered today that are fully CLOSED
+        today_closed_ids = df[
+            df['Entry_Time'].str.contains(self.today_str, na=False) &
+            (df['Status'] == 'CLOSED')
+        ]['Trade_ID'].unique()
+
+        # Sum PnL from exit-leg rows only (blank Entry_Time); entry rows carry 0.0
+        exit_rows = df[(df['Trade_ID'].isin(today_closed_ids)) & (df['Entry_Time'].isna())]
+        trade_pnl = exit_rows.groupby('Trade_ID')['PnL'].sum()
+
+        # Per-ticker cumulative PnL (exit legs only)
         for ticker in TICKER_SQUAD:
-            ticker_trades = closed_today[closed_today['Ticker'] == ticker]
-            self.ticker_pnl[ticker] = float(ticker_trades['PnL'].sum())
-            
-        self.daily_wins = int((closed_today['PnL'] > 0).sum())
-        self.daily_losses = int((closed_today['PnL'] <= 0).sum())
-        print(f"🔄 State Recovery: Hydrated {len(closed_today)} past entries. Session: {self.daily_wins}W-{self.daily_losses}L")
+            self.ticker_pnl[ticker] = float(exit_rows[exit_rows['Ticker'] == ticker]['PnL'].sum())
+
+        # One win/loss result per trade
+        self.daily_wins = int((trade_pnl > 0).sum())
+        self.daily_losses = int((trade_pnl <= 0).sum())
+        print(f"🔄 State Recovery: Hydrated {len(trade_pnl)} past trades. Session: {self.daily_wins}W-{self.daily_losses}L")
 
     def _reconcile_with_alpaca(self):
         """Compares Alpaca's real account equity against the trade-log cumulative
