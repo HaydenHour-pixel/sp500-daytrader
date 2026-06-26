@@ -364,20 +364,21 @@ class AlphaHardTargetScalper:
             send_slack_alert(f"🚨 *Power Hour E-Stop: Liquidating {len(positions)} position(s) before close.*")
             for pos in positions:
                 print(f"   Liquidating {pos.symbol}: {int(pos.qty)} shares @ ${pos.current_price}")
-                if pos.symbol not in self.in_flight_sales:
-                    try:
-                        fallback_price = float(pos.current_price)
-                    except Exception:
-                        fallback_price = float(pos.avg_entry_price)
-                    order = self.execute_order(pos.symbol, int(pos.qty), OrderSide.SELL)
-                    if order is not None:
-                        print(f"   ✅ Order accepted for {pos.symbol}")
-                        self.in_flight_sales.add(pos.symbol)
-                        fill_price = self._get_fill_price(order.id, fallback_price)
-                        trade_id = self._get_open_trade_id(pos.symbol)
+                try:
+                    fallback_price = float(pos.current_price)
+                except Exception:
+                    fallback_price = float(pos.avg_entry_price)
+                # E-Stop is authoritative: flatten whatever Alpaca reports open,
+                # regardless of in_flight_sales (which can be stale from a partial fill)
+                order = self.execute_order(pos.symbol, int(pos.qty), OrderSide.SELL, tif=TimeInForce.DAY)
+                if order is not None:
+                    print(f"   ✅ Order accepted for {pos.symbol}")
+                    fill_price = self._get_fill_price(order.id, fallback_price)
+                    trade_id = self._get_open_trade_id(pos.symbol)
+                    if trade_id is not None:
                         self._log_trade_exit(pos.symbol, int(pos.qty), fill_price, trade_id)
-                    else:
-                        print(f"   ❌ Order REJECTED for {pos.symbol}")
+                else:
+                    print(f"   ❌ Order REJECTED for {pos.symbol}")
             return
 
         try:
