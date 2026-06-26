@@ -382,10 +382,10 @@ class AlphaHardTargetScalper:
                 order = self.execute_order(pos.symbol, int(pos.qty), OrderSide.SELL, tif=TimeInForce.DAY)
                 if order is not None:
                     print(f"   ✅ Order accepted for {pos.symbol}")
-                    fill_price = self._get_fill_price(order.id, fallback_price)
+                    fill_price, filled_qty = self._get_fill_price(order.id, fallback_price, int(pos.qty))
                     trade_id = self._get_open_trade_id(pos.symbol)
                     if trade_id is not None:
-                        self._log_trade_exit(pos.symbol, int(pos.qty), fill_price, trade_id)
+                        self._log_trade_exit(pos.symbol, filled_qty, fill_price, trade_id)
                 else:
                     print(f"   ❌ Order REJECTED for {pos.symbol}")
             return
@@ -423,9 +423,9 @@ class AlphaHardTargetScalper:
                             current_price_val = float(alpaca_position.current_price)
                             order = self.execute_order(ticker, qty, OrderSide.SELL)
                             if order is not None:
-                                fill_price = self._get_fill_price(order.id, current_price_val)
+                                fill_price, filled_qty = self._get_fill_price(order.id, current_price_val, qty)
                                 trade_id = self._get_open_trade_id(ticker)
-                                self._log_trade_exit(ticker, qty, fill_price, trade_id)
+                                self._log_trade_exit(ticker, filled_qty, fill_price, trade_id)
                                 send_slack_alert(f"🏁 *Lull Close ({ticker})*: Position liquidated at 13:30 (lull end).")
                                 self.in_flight_sales.add(ticker)
                         continue
@@ -439,8 +439,8 @@ class AlphaHardTargetScalper:
                         if qty < 5:
                             order = self.execute_order(ticker, qty, OrderSide.SELL)
                             if order is not None:
-                                fill_price = self._get_fill_price(order.id, current_price)
-                                self._log_trade_exit(ticker, qty, fill_price)
+                                fill_price, filled_qty = self._get_fill_price(order.id, current_price, qty)
+                                self._log_trade_exit(ticker, filled_qty, fill_price)
                             continue
 
                         atr = self.calculate_atr(ticker_df)
@@ -459,9 +459,9 @@ class AlphaHardTargetScalper:
                             order = self.execute_order(ticker, qty, OrderSide.SELL)
                             if order is not None:
                                 self.in_flight_sales.add(ticker)
-                                fill_price = self._get_fill_price(order.id, current_price)
+                                fill_price, filled_qty = self._get_fill_price(order.id, current_price, qty)
                                 trade_id = self._get_open_trade_id(ticker)
-                                self._log_trade_exit(ticker, qty, fill_price, trade_id)
+                                self._log_trade_exit(ticker, filled_qty, fill_price, trade_id)
                                 time.sleep(30)
                             continue
 
@@ -508,8 +508,9 @@ class AlphaHardTargetScalper:
                         if qty > 0 and (qty * current_price) <= buy_power:
                             order = self.execute_order(ticker, qty, OrderSide.BUY)
                             if order is not None:
-                                fill_price = self._get_fill_price(order.id, current_price)
-                                self._log_trade_entry(f"tr_{int(time.time())}", ticker, qty, fill_price, active_engine, rsi)
+                                fill_price, filled_qty = self._get_fill_price(order.id, current_price, qty)
+                                if filled_qty > 0:
+                                    self._log_trade_entry(f"tr_{int(time.time())}", ticker, filled_qty, fill_price, active_engine, rsi)
                                 send_slack_alert(
                                     f"🚀 *Position Opened ({ticker})*\n"
                                     f"• Action: *BUY (Trend-Aware)*\n"
@@ -547,18 +548,27 @@ class AlphaHardTargetScalper:
             print(f"   ❌ Order REJECTED ({ticker}): {e}")
             return None
 
-    def _get_fill_price(self, order_id, fallback_price):
-        """Polls Alpaca for the real average fill price of a submitted order."""
-        for _ in range(5):
+    def _get_fill_price(self, order_id, fallback_price, fallback_qty):
+        """Polls Alpaca for real avg fill price and filled qty. Waits for the
+        order to reach a terminal state (filled/partially filled/canceled) rather
+        than giving up after a few seconds."""
+        for attempt in range(30):  # up to ~30s
             try:
                 o = self.client.get_order_by_id(order_id)
-                if o.filled_avg_price is not None:
-                    return float(o.filled_avg_price)
+                status = str(o.status).lower()
+                # If we have any fill data, prefer it
+                if o.filled_avg_price is not None and o.filled_qty is not None:
+                    fq = int(float(o.filled_qty))
+                    if fq > 0 and status in ("filled", "canceled", "expired", "done_for_day"):
+                        return float(o.filled_avg_price), fq
+                if status in ("canceled", "expired", "rejected", "done_for_day") and (o.filled_qty is None or int(float(o.filled_qty)) == 0):
+                    print(f"   ⚠️ Order {status} with no fill")
+                    return float(fallback_price), 0
             except Exception as e:
-                print(f"   ⚠️ Fill price poll error: {e}")
+                print(f"   ⚠️ Fill poll error: {e}")
             time.sleep(1)
-        print(f"   ⚠️ Fill price unavailable, using fallback ${fallback_price:.2f}")
-        return float(fallback_price)
+        print(f"   ⚠️ Fill data unavailable after 30s, using fallback ${fallback_price:.2f} x {fallback_qty}")
+        return float(fallback_price), int(fallback_qty)
 
 if __name__ == "__main__":
     bot = AlphaHardTargetScalper()
