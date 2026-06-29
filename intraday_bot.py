@@ -549,19 +549,19 @@ class AlphaHardTargetScalper:
             return None
 
     def _get_fill_price(self, order_id, fallback_price, fallback_qty):
-        """Polls Alpaca for real avg fill price and filled qty. Waits for the
-        order to reach a terminal state (filled/partially filled/canceled) rather
-        than giving up after a few seconds."""
-        for attempt in range(30):  # up to ~30s
+        """Polls Alpaca for real avg fill price and filled qty. Reads the enum
+        status by .value so terminal states are correctly detected."""
+        terminal_fill = {"filled", "partially_filled"}
+        terminal_dead = {"canceled", "expired", "rejected", "done_for_day"}
+        for attempt in range(30):  # up to ~30s, but exits as soon as filled
             try:
                 o = self.client.get_order_by_id(order_id)
-                status = str(o.status).lower()
-                # If we have any fill data, prefer it
+                status = getattr(o.status, "value", str(o.status)).lower()
                 if o.filled_avg_price is not None and o.filled_qty is not None:
                     fq = int(float(o.filled_qty))
-                    if fq > 0 and status in ("filled", "canceled", "expired", "done_for_day"):
+                    if fq > 0 and status in (terminal_fill | terminal_dead):
                         return float(o.filled_avg_price), fq
-                if status in ("canceled", "expired", "rejected", "done_for_day") and (o.filled_qty is None or int(float(o.filled_qty)) == 0):
+                if status in terminal_dead and (o.filled_qty is None or int(float(o.filled_qty)) == 0):
                     print(f"   ⚠️ Order {status} with no fill")
                     return float(fallback_price), 0
             except Exception as e:
