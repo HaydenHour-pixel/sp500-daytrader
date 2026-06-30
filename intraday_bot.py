@@ -373,19 +373,20 @@ class AlphaHardTargetScalper:
             send_slack_alert(f"🚨 *Power Hour E-Stop: Liquidating {len(positions)} position(s) before close.*")
             for pos in positions:
                 print(f"   Liquidating {pos.symbol}: {int(pos.qty)} shares @ ${pos.current_price}")
-                try:
-                    fallback_price = float(pos.current_price)
-                except Exception:
-                    fallback_price = float(pos.avg_entry_price)
                 # E-Stop is authoritative: flatten whatever Alpaca reports open,
                 # regardless of in_flight_sales (which can be stale from a partial fill)
                 order = self.execute_order(pos.symbol, int(pos.qty), OrderSide.SELL, tif=TimeInForce.DAY)
                 if order is not None:
                     print(f"   ✅ Order accepted for {pos.symbol}")
-                    fill_price, filled_qty = self._get_fill_price(order.id, fallback_price, int(pos.qty))
+                    fill_price, filled_qty = self._get_fill_price(order.id)
                     trade_id = self._get_open_trade_id(pos.symbol)
-                    if trade_id is not None:
-                        self._log_trade_exit(pos.symbol, filled_qty, fill_price, trade_id)
+                    if fill_price is not None and filled_qty > 0:
+                        if trade_id is not None:
+                            self._log_trade_exit(pos.symbol, filled_qty, fill_price, trade_id)
+                    else:
+                        msg = f"🚨 E-Stop fill unconfirmed for {pos.symbol} — trade NOT logged, manual check needed"
+                        print(f"   ⚠️ {msg}")
+                        send_slack_alert(msg)
                 else:
                     print(f"   ❌ Order REJECTED for {pos.symbol}")
             return
@@ -420,13 +421,17 @@ class AlphaHardTargetScalper:
                         if ticker not in self.in_flight_sales:
                             alpaca_position = next(pos for pos in positions if pos.symbol == ticker)
                             qty = int(alpaca_position.qty)
-                            current_price_val = float(alpaca_position.current_price)
                             order = self.execute_order(ticker, qty, OrderSide.SELL)
                             if order is not None:
-                                fill_price, filled_qty = self._get_fill_price(order.id, current_price_val, qty)
+                                fill_price, filled_qty = self._get_fill_price(order.id)
                                 trade_id = self._get_open_trade_id(ticker)
-                                self._log_trade_exit(ticker, filled_qty, fill_price, trade_id)
-                                send_slack_alert(f"🏁 *Lull Close ({ticker})*: Position liquidated at 13:30 (lull end).")
+                                if fill_price is not None and filled_qty > 0:
+                                    self._log_trade_exit(ticker, filled_qty, fill_price, trade_id)
+                                    send_slack_alert(f"🏁 *Lull Close ({ticker})*: Position liquidated at 13:30 (lull end).")
+                                else:
+                                    msg = f"🚨 Lull-close fill unconfirmed for {ticker} SELL — trade NOT logged, manual check needed"
+                                    print(f"   ⚠️ {msg}")
+                                    send_slack_alert(msg)
                                 self.in_flight_sales.add(ticker)
                         continue
 
@@ -439,8 +444,13 @@ class AlphaHardTargetScalper:
                         if qty < 5:
                             order = self.execute_order(ticker, qty, OrderSide.SELL)
                             if order is not None:
-                                fill_price, filled_qty = self._get_fill_price(order.id, current_price, qty)
-                                self._log_trade_exit(ticker, filled_qty, fill_price)
+                                fill_price, filled_qty = self._get_fill_price(order.id)
+                                if fill_price is not None and filled_qty > 0:
+                                    self._log_trade_exit(ticker, filled_qty, fill_price)
+                                else:
+                                    msg = f"🚨 Dust-guard fill unconfirmed for {ticker} SELL — trade NOT logged, manual check needed"
+                                    print(f"   ⚠️ {msg}")
+                                    send_slack_alert(msg)
                             continue
 
                         atr = self.calculate_atr(ticker_df)
@@ -459,9 +469,14 @@ class AlphaHardTargetScalper:
                             order = self.execute_order(ticker, qty, OrderSide.SELL)
                             if order is not None:
                                 self.in_flight_sales.add(ticker)
-                                fill_price, filled_qty = self._get_fill_price(order.id, current_price, qty)
+                                fill_price, filled_qty = self._get_fill_price(order.id)
                                 trade_id = self._get_open_trade_id(ticker)
-                                self._log_trade_exit(ticker, filled_qty, fill_price, trade_id)
+                                if fill_price is not None and filled_qty > 0:
+                                    self._log_trade_exit(ticker, filled_qty, fill_price, trade_id)
+                                else:
+                                    msg = f"🚨 Exit fill unconfirmed for {ticker} SELL — trade NOT logged, manual check needed"
+                                    print(f"   ⚠️ {msg}")
+                                    send_slack_alert(msg)
                                 time.sleep(30)
                             continue
 
@@ -508,17 +523,21 @@ class AlphaHardTargetScalper:
                         if qty > 0 and (qty * current_price) <= buy_power:
                             order = self.execute_order(ticker, qty, OrderSide.BUY)
                             if order is not None:
-                                fill_price, filled_qty = self._get_fill_price(order.id, current_price, qty)
-                                if filled_qty > 0:
+                                fill_price, filled_qty = self._get_fill_price(order.id)
+                                if fill_price is not None and filled_qty > 0:
                                     self._log_trade_entry(f"tr_{int(time.time())}", ticker, filled_qty, fill_price, active_engine, rsi)
-                                send_slack_alert(
-                                    f"🚀 *Position Opened ({ticker})*\n"
-                                    f"• Action: *BUY (Trend-Aware)*\n"
-                                    f"• Shares: {qty}\n"
-                                    f"• Price: ${fill_price:.2f}\n"
-                                    f"• RSI at Entry: {rsi:.1f}\n"
-                                    f"• Engine: {active_engine}"
-                                )
+                                    send_slack_alert(
+                                        f"🚀 *Position Opened ({ticker})*\n"
+                                        f"• Action: *BUY (Trend-Aware)*\n"
+                                        f"• Shares: {qty}\n"
+                                        f"• Price: ${fill_price:.2f}\n"
+                                        f"• RSI at Entry: {rsi:.1f}\n"
+                                        f"• Engine: {active_engine}"
+                                    )
+                                else:
+                                    msg = f"🚨 Entry fill unconfirmed for {ticker} BUY — trade NOT logged, manual check needed"
+                                    print(f"   ⚠️ {msg}")
+                                    send_slack_alert(msg)
                                 time.sleep(60) # Cool down after entry to let trend develop
 
             except Exception as e:
@@ -548,27 +567,27 @@ class AlphaHardTargetScalper:
             print(f"   ❌ Order REJECTED ({ticker}): {e}")
             return None
 
-    def _get_fill_price(self, order_id, fallback_price, fallback_qty):
-        """Polls Alpaca for real avg fill price and filled qty. Reads the enum
-        status by .value so terminal states are correctly detected."""
-        terminal_fill = {"filled", "partially_filled"}
-        terminal_dead = {"canceled", "expired", "rejected", "done_for_day"}
-        for attempt in range(30):  # up to ~30s, but exits as soon as filled
+    def _get_fill_price(self, order_id):
+        """Polls Alpaca for real avg fill price and filled qty. Never fabricates
+        a price — returns (None, 0) if no confirmed fill is available after 90s."""
+        terminal_states = {"filled", "partially_filled", "canceled", "expired", "rejected", "done_for_day"}
+        for _ in range(90):  # up to ~90s, exits early on confirmed fill
             try:
                 o = self.client.get_order_by_id(order_id)
                 status = getattr(o.status, "value", str(o.status)).lower()
-                if o.filled_avg_price is not None and o.filled_qty is not None:
-                    fq = int(float(o.filled_qty))
-                    if fq > 0 and status in (terminal_fill | terminal_dead):
-                        return float(o.filled_avg_price), fq
-                if status in terminal_dead and (o.filled_qty is None or int(float(o.filled_qty)) == 0):
-                    print(f"   ⚠️ Order {status} with no fill")
-                    return float(fallback_price), 0
+                fq = int(float(o.filled_qty)) if o.filled_qty is not None else 0
+                if fq > 0 and status in terminal_states:
+                    return float(o.filled_avg_price), fq
+                if status in {"canceled", "expired", "rejected", "done_for_day"} and fq == 0:
+                    print(f"   ⚠️ Order {order_id} reached terminal state '{status}' with zero fill")
+                    return None, 0
             except Exception as e:
                 print(f"   ⚠️ Fill poll error: {e}")
             time.sleep(1)
-        print(f"   ⚠️ Fill data unavailable after 30s, using fallback ${fallback_price:.2f} x {fallback_qty}")
-        return float(fallback_price), int(fallback_qty)
+        msg = f"🚨 Unconfirmed fill for order {order_id} after 90s — trade NOT logged, manual check needed"
+        print(f"   ⚠️ {msg}")
+        send_slack_alert(msg)
+        return None, 0
 
 if __name__ == "__main__":
     bot = AlphaHardTargetScalper()
